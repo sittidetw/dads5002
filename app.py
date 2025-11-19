@@ -42,6 +42,12 @@ DEFAULT_QUESTIONS = [
     },
 ]
 ASSIGNMENT_TYPES = ["Individual", "Group"]
+PARTICIPATION_STEP = 1.0
+FREE_RESPONSE_ACTIVITY_NAME = "Free response (student-defined)"
+FREE_RESPONSE_DESCRIPTION = (
+    "This system-managed activity lets students craft their own prompts and submit long-form answers."
+)
+FREE_RESPONSE_ACTIVITY_ID: int | None = None
 
 
 def now_th():
@@ -310,6 +316,40 @@ def get_activities(active_only=True) -> pd.DataFrame:
     df = pd.read_sql_query(query, con)
     con.close()
     return df
+
+
+def ensure_free_response_activity():
+    con = get_con()
+    cur = con.cursor()
+    cur.execute("SELECT id, active FROM activities WHERE name=? LIMIT 1", (FREE_RESPONSE_ACTIVITY_NAME,))
+    row = cur.fetchone()
+    if row:
+        activity_id = int(row[0])
+        if not bool(row[1]):
+            cur.execute("UPDATE activities SET active=1 WHERE id=?", (activity_id,))
+            con.commit()
+        con.close()
+        return activity_id
+    cur.execute(
+        """
+        INSERT INTO activities (name, activity_date, assignment_type, description, active)
+        VALUES (?,?,?,?,1)
+        """,
+        (FREE_RESPONSE_ACTIVITY_NAME, None, "Individual", FREE_RESPONSE_DESCRIPTION),
+    )
+    activity_id = cur.lastrowid
+    con.commit()
+    con.close()
+    return int(activity_id)
+
+
+def is_free_response_activity(activity_id):
+    if activity_id is None or FREE_RESPONSE_ACTIVITY_ID is None:
+        return False
+    try:
+        return int(activity_id) == int(FREE_RESPONSE_ACTIVITY_ID)
+    except (TypeError, ValueError):
+        return False
 
 
 def save_activity(activity_id, name, activity_date, assignment_type, description, active):
@@ -830,6 +870,22 @@ def adjust_daily_score(check_in_date: str, student_id: str, delta: float):
     st.session_state["daily_participation_adjust"] = adjustments
 
 
+def apply_daily_participation_adjustments(df: pd.DataFrame, check_in_date: str):
+    if df.empty:
+        return df
+    adjustments = st.session_state.get("daily_participation_adjust", {})
+    if not adjustments:
+        return df
+    df = df.copy()
+    for idx, row in df.iterrows():
+        key = f"{check_in_date}|{row['student_id']}"
+        delta = adjustments.get(key, 0.0)
+        if delta:
+            base = float(row.get("participation_points", 0) or 0)
+            df.at[idx, "participation_points"] = base + delta
+    return df
+
+
 def build_activity_label_map(df: pd.DataFrame):
     return {
         int(row["id"]): f"{row['name']} ({safe_date_label(row['activity_date'])})"
@@ -887,7 +943,37 @@ def clear_student_inputs():
     for key in st.session_state.get("student_answer_keys", []):
         st.session_state.pop(key, None)
     st.session_state["student_answer_keys"] = []
+    reset_free_response_state()
     set_nav_warning("")
+
+
+def reset_free_response_state():
+    st.session_state["free_response_entries"] = []
+    st.session_state["free_response_mode"] = False
+
+
+def new_free_response_entry():
+    return {"uid": secrets.token_hex(4), "question": "", "answer": ""}
+
+
+def start_free_response_mode(activity_id: int):
+    st.session_state["free_response_mode"] = True
+    st.session_state["free_response_entries"] = [new_free_response_entry()]
+    st.session_state.question_set = []
+    st.session_state.answers = []
+    st.session_state.q_index = 0
+    st.session_state.started = True
+    st.session_state.show_preview = False
+    st.session_state.selected_activity = int(activity_id) if activity_id is not None else None
+    set_nav_warning("")
+
+
+def ensure_free_response_entries():
+    entries = st.session_state.get("free_response_entries", [])
+    if not entries:
+        entries = [new_free_response_entry()]
+    st.session_state["free_response_entries"] = entries
+    return entries
 
 
 def reset_student_state(question_set, activity_id):
@@ -906,6 +992,85 @@ def register_student_answer_key(key: str):
     if key not in keys:
         keys.append(key)
         st.session_state["student_answer_keys"] = keys
+
+
+def render_free_response_form(student_id: str, group_name: str):
+    activity = get_activity(st.session_state.selected_activity)
+    st.write(
+        f"**Activity:** {activity.get('name') if activity else 'Free response'} · "
+        f"{activity.get('assignment_type') if activity else 'Assignment'}"
+    )
+    st.caption("Add your own prompts/questions and respond with long-form answers. Leave prompts blank to remove them.")
+    entries = ensure_free_response_entries()
+    remove_uid = None
+    for idx, entry in enumerate(entries):
+        uid = entry.get("uid") or secrets.token_hex(4)
+        entry["uid"] = uid
+        question_key = f"free_question_{uid}"
+        answer_key = f"free_answer_{uid}"
+        register_student_answer_key(question_key)
+        register_student_answer_key(answer_key)
+        current_question = st.text_input(
+            f"Question / prompt {idx + 1}",
+            value=entry.get("question", ""),
+            key=question_key,
+            placeholder="e.g., Summarize what you learned today",
+        )
+        current_answer = st.text_area(
+            f"Answer {idx + 1}",
+            value=entry.get("answer", ""),
+            key=answer_key,
+            height=160,
+        )
+        entry["question"] = current_question
+        entry["answer"] = current_answer
+        if idx > 0:
+            if st.button("Remove", key=f"free_remove_{uid}", type="secondary"):
+                remove_uid = uid
+    if remove_uid:
+        entries = [entry for entry in entries if entry.get("uid") != remove_uid]
+        st.session_state["free_response_entries"] = entries or [new_free_response_entry()]
+        st.session_state.pop(f"free_question_{remove_uid}", None)
+        st.session_state.pop(f"free_answer_{remove_uid}", None)
+        st.rerun()
+    if st.button("➕ Add question/prompt", key="free_add_prompt", use_container_width=True):
+        entries.append(new_free_response_entry())
+        st.session_state["free_response_entries"] = entries
+        st.rerun()
+    valid_entries = [
+        {
+            "question": entry.get("question", "").strip(),
+            "answer": entry.get("answer", "").strip(),
+        }
+        for entry in entries
+        if entry.get("question", "").strip() and entry.get("answer", "").strip()
+    ]
+    st.caption("At least one prompt and answer are required to submit.")
+    if st.button("🟦 Submit free response", use_container_width=True, disabled=not valid_entries, key="free_submit"):
+        qa_payload = []
+        for idx, entry in enumerate(valid_entries, start=1):
+            qa_payload.append(
+                {
+                    "question_id": None,
+                    "question_no": idx,
+                    "question": entry["question"],
+                    "answer": entry["answer"],
+                }
+            )
+        save_answers(
+            student_id.strip(),
+            st.session_state.selected_activity,
+            qa_payload,
+            group_name.strip(),
+        )
+        st.success("Your answers have been submitted successfully!")
+        clear_student_inputs()
+        st.session_state.started = False
+        st.session_state.q_index = 0
+        st.session_state.answers = []
+        st.session_state.show_preview = False
+        st.session_state.question_set = []
+        st.session_state.selected_activity = None
 
 
 def handle_mc_change(question_idx: int, question: dict, total_questions: int, key: str, placeholder: str):
@@ -934,6 +1099,7 @@ def set_nav_warning(message: str = ""):
 
 # ---------- App ----------
 init_db()
+FREE_RESPONSE_ACTIVITY_ID = ensure_free_response_activity()
 st.set_page_config(page_title="DADS5002 Design Thinking", page_icon="✅", layout="wide")
 
 st.session_state.setdefault("started", False)
@@ -950,6 +1116,8 @@ st.session_state.setdefault("student_answer_keys", [])
 st.session_state.setdefault("question_builders", {})
 st.session_state.setdefault("nav_warning", "")
 st.session_state.setdefault("daily_participation_adjust", {})
+st.session_state.setdefault("free_response_mode", False)
+st.session_state.setdefault("free_response_entries", [])
 
 st.title("📚 Student Activity Response Collector")
 tab_student, tab_teacher = st.tabs(["👩‍🎓 Student", "👨‍🏫 Teacher"])
@@ -977,7 +1145,7 @@ with tab_student:
         chosen_label = st.selectbox("Activity", options=activity_options, index=0)
         activity_id = activity_labels.get(chosen_label)
     group_name = st.text_input("Group Name (optional)", placeholder="e.g., Team Alpha", key="student_group_name_input")
-    check_in_note = st.text_input("Check-in note (optional)", placeholder="e.g., Present in class")
+    check_in_note = ""
     check_in_disabled = not student_id.strip()
     if st.button("📍 Check In", use_container_width=True, disabled=check_in_disabled):
         if not student_id.strip():
@@ -992,153 +1160,160 @@ with tab_student:
         elif not activity_id:
             st.warning("Please select an activity.")
         else:
-            question_set = load_question_bundle(activity_id)
-            reset_student_state(question_set, activity_id)
+            if is_free_response_activity(activity_id):
+                clear_student_inputs()
+                start_free_response_mode(activity_id)
+            else:
+                question_set = load_question_bundle(activity_id)
+                reset_student_state(question_set, activity_id)
 
     if st.session_state.started:
         st.divider()
-        activity = get_activity(st.session_state.selected_activity)
-        question_set = st.session_state.get("question_set", [])
-        if not question_set:
-            question_set = load_question_bundle(st.session_state.selected_activity)
-            st.session_state.question_set = question_set
-            st.session_state.answers = [""] * len(question_set)
-        total = len(question_set)
-        st.write(
-            f"**Activity:** {activity.get('name') if activity else 'N/A'} · "
-            f"{activity.get('assignment_type') if activity else 'Assignment'} · "
-            f"{safe_date_label(activity.get('activity_date') if activity else None, 'Date not set')}"
-        )
-
-        q_idx = max(0, min(st.session_state.q_index, total - 1))
-        st.session_state.q_index = q_idx
-        st.progress((q_idx + 1) / total, text=f"Question {q_idx + 1} of {total}")
-        current_q = question_set[q_idx]
-        st.markdown(f"**Question {current_q['question_no']}**")
-        st.info(current_q["question"])
-
-        if len(st.session_state.answers) != total:
-            st.session_state.answers = (st.session_state.answers + [""] * total)[:total]
-
-        response_type = current_q.get("response_type", "long_text")
-        answer_widget_key = f"answer_{st.session_state.selected_activity}_{current_q['question_no']}_{response_type}"
-        register_student_answer_key(answer_widget_key)
-        existing_answer = st.session_state.answers[q_idx]
-        answer_value = existing_answer
-        if response_type == "multiple_choice":
-            options = current_q.get("options") or []
-            if not options:
-                st.warning("This question has no options configured; defaulting to text response.")
-                response_type = "long_text"
-            else:
-                placeholder = MC_PLACEHOLDER
-                choices = [placeholder, *options]
-                default_index = 0
-                if existing_answer in options:
-                    default_index = options.index(existing_answer) + 1
-                selected_option = st.radio(
-                    "Choose an option",
-                    options=choices,
-                    index=default_index,
-                    key=answer_widget_key,
-                    on_change=handle_mc_change,
-                    kwargs={
-                        "question_idx": q_idx,
-                        "question": current_q,
-                        "total_questions": total,
-                        "key": answer_widget_key,
-                        "placeholder": placeholder,
-                    },
-                )
-                answer_value = "" if selected_option == placeholder else selected_option
-
-        if response_type != "multiple_choice":
-            answer_value = st.text_area(
-                "Your Answer",
-                value=existing_answer,
-                height=160,
-                key=answer_widget_key,
+        if st.session_state.get("free_response_mode") and is_free_response_activity(st.session_state.selected_activity):
+            render_free_response_form(student_id, group_name)
+        else:
+            activity = get_activity(st.session_state.selected_activity)
+            question_set = st.session_state.get("question_set", [])
+            if not question_set:
+                question_set = load_question_bundle(st.session_state.selected_activity)
+                st.session_state.question_set = question_set
+                st.session_state.answers = [""] * len(question_set)
+            total = len(question_set)
+            st.write(
+                f"**Activity:** {activity.get('name') if activity else 'N/A'} · "
+                f"{activity.get('assignment_type') if activity else 'Assignment'} · "
+                f"{safe_date_label(activity.get('activity_date') if activity else None, 'Date not set')}"
             )
 
-        st.session_state.answers[q_idx] = answer_value
-        current_a_filled = answer_is_filled(current_q, st.session_state.answers[q_idx])
-        if current_a_filled and st.session_state.get("nav_warning"):
-            set_nav_warning("")
+            q_idx = max(0, min(st.session_state.q_index, total - 1))
+            st.session_state.q_index = q_idx
+            st.progress((q_idx + 1) / total, text=f"Question {q_idx + 1} of {total}")
+            current_q = question_set[q_idx]
+            st.markdown(f"**Question {current_q['question_no']}**")
+            st.info(current_q["question"])
 
-        c1, c2 = st.columns(2)
-        with c1:
-            back_clicked = st.button(
-                "⬅️ Back",
-                use_container_width=True,
-                disabled=(q_idx == 0),
-                key=f"back_btn_{q_idx}",
-            )
-            if back_clicked and q_idx > 0:
-                st.session_state.q_index = max(0, q_idx - 1)
-                st.session_state.show_preview = False
-                set_nav_warning("")
-        with c2:
-            next_clicked = st.button(
-                "➡️ Next",
-                use_container_width=True,
-                disabled=(q_idx >= total - 1),
-                key=f"next_btn_{q_idx}",
-            )
-            if next_clicked:
-                if not current_a_filled:
-                    set_nav_warning("Please answer this question before continuing.")
+            if len(st.session_state.answers) != total:
+                st.session_state.answers = (st.session_state.answers + [""] * total)[:total]
+
+            response_type = current_q.get("response_type", "long_text")
+            answer_widget_key = f"answer_{st.session_state.selected_activity}_{current_q['question_no']}_{response_type}"
+            register_student_answer_key(answer_widget_key)
+            existing_answer = st.session_state.answers[q_idx]
+            answer_value = existing_answer
+            if response_type == "multiple_choice":
+                options = current_q.get("options") or []
+                if not options:
+                    st.warning("This question has no options configured; defaulting to text response.")
+                    response_type = "long_text"
                 else:
-                    st.session_state.q_index = min(total - 1, q_idx + 1)
+                    placeholder = MC_PLACEHOLDER
+                    choices = [placeholder, *options]
+                    default_index = 0
+                    if existing_answer in options:
+                        default_index = options.index(existing_answer) + 1
+                    selected_option = st.radio(
+                        "Choose an option",
+                        options=choices,
+                        index=default_index,
+                        key=answer_widget_key,
+                        on_change=handle_mc_change,
+                        kwargs={
+                            "question_idx": q_idx,
+                            "question": current_q,
+                            "total_questions": total,
+                            "key": answer_widget_key,
+                            "placeholder": placeholder,
+                        },
+                    )
+                    answer_value = "" if selected_option == placeholder else selected_option
+
+            if response_type != "multiple_choice":
+                answer_value = st.text_area(
+                    "Your Answer",
+                    value=existing_answer,
+                    height=160,
+                    key=answer_widget_key,
+                )
+
+            st.session_state.answers[q_idx] = answer_value
+            current_a_filled = answer_is_filled(current_q, st.session_state.answers[q_idx])
+            if current_a_filled and st.session_state.get("nav_warning"):
+                set_nav_warning("")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                back_clicked = st.button(
+                    "⬅️ Back",
+                    use_container_width=True,
+                    disabled=(q_idx == 0),
+                    key=f"back_btn_{q_idx}",
+                )
+                if back_clicked and q_idx > 0:
+                    st.session_state.q_index = max(0, q_idx - 1)
                     st.session_state.show_preview = False
                     set_nav_warning("")
-
-        if st.session_state.get("nav_warning"):
-            st.warning(st.session_state["nav_warning"])
-
-        all_filled = all(
-            answer_is_filled(question_set[idx], st.session_state.answers[idx])
-            for idx in range(total)
-        )
-        st.caption("Fill every answer to unlock preview & submit.")
-        if st.button("👁️ Preview", use_container_width=True, disabled=not all_filled):
-            st.session_state.show_preview = True
-
-        if st.session_state.get("show_preview"):
-            st.subheader("Preview & Submit")
-            df_prev = pd.DataFrame(
-                {
-                    "Question No.": [q["question_no"] for q in question_set],
-                    "Question": [q["question"] for q in question_set],
-                    "Answer": st.session_state.answers[:total],
-                }
-            )
-            st.dataframe(df_prev, use_container_width=True, hide_index=True)
-            if st.button("🟦 SUBMIT", use_container_width=True, disabled=not all_filled):
-                qa_payload = []
-                for idx, q in enumerate(question_set):
-                    qa_payload.append(
-                        {
-                            "question_id": q.get("id"),
-                            "question_no": q.get("question_no"),
-                            "question": q.get("question"),
-                            "answer": st.session_state.answers[idx].strip(),
-                        }
-                    )
-                group_name_value = st.session_state.get("student_group_name_input", "").strip()
-                save_answers(
-                    student_id.strip(),
-                    st.session_state.selected_activity,
-                    qa_payload,
-                    group_name_value,
+            with c2:
+                next_clicked = st.button(
+                    "➡️ Next",
+                    use_container_width=True,
+                    disabled=(q_idx >= total - 1),
+                    key=f"next_btn_{q_idx}",
                 )
-                st.success("Your answers have been submitted successfully!")
-                clear_student_inputs()
-                st.session_state.started = False
-                st.session_state.q_index = 0
-                st.session_state.answers = []
-                st.session_state.show_preview = False
-                st.session_state.question_set = []
-                st.session_state.selected_activity = None
+                if next_clicked:
+                    if not current_a_filled:
+                        set_nav_warning("Please answer this question before continuing.")
+                    else:
+                        st.session_state.q_index = min(total - 1, q_idx + 1)
+                        st.session_state.show_preview = False
+                        set_nav_warning("")
+
+            if st.session_state.get("nav_warning"):
+                st.warning(st.session_state["nav_warning"])
+
+            all_filled = all(
+                answer_is_filled(question_set[idx], st.session_state.answers[idx])
+                for idx in range(total)
+            )
+            st.caption("Fill every answer to unlock preview & submit.")
+            if st.button("👁️ Preview", use_container_width=True, disabled=not all_filled):
+                st.session_state.show_preview = True
+
+            if st.session_state.get("show_preview"):
+                st.subheader("Preview & Submit")
+                df_prev = pd.DataFrame(
+                    {
+                        "Question No.": [q["question_no"] for q in question_set],
+                        "Question": [q["question"] for q in question_set],
+                        "Answer": st.session_state.answers[:total],
+                    }
+                )
+                st.dataframe(df_prev, use_container_width=True, hide_index=True)
+                if st.button("🟦 SUBMIT", use_container_width=True, disabled=not all_filled):
+                    qa_payload = []
+                    for idx, q in enumerate(question_set):
+                        qa_payload.append(
+                            {
+                                "question_id": q.get("id"),
+                                "question_no": q.get("question_no"),
+                                "question": q.get("question"),
+                                "answer": st.session_state.answers[idx].strip(),
+                            }
+                        )
+                    group_name_value = st.session_state.get("student_group_name_input", "").strip()
+                    save_answers(
+                        student_id.strip(),
+                        st.session_state.selected_activity,
+                        qa_payload,
+                        group_name_value,
+                    )
+                    st.success("Your answers have been submitted successfully!")
+                    clear_student_inputs()
+                    st.session_state.started = False
+                    st.session_state.q_index = 0
+                    st.session_state.answers = []
+                    st.session_state.show_preview = False
+                    st.session_state.question_set = []
+                    st.session_state.selected_activity = None
 
 
 # ---------------- Teacher ----------------
@@ -1179,425 +1354,474 @@ with tab_teacher:
                     st.success("Password updated for this session.")
         activities_all = get_activities(active_only=False)
 
-        # Roster upload/management
-        st.divider()
-        st.markdown("### 🧑‍🎓 Student roster (IDs → names)")
-        roster_df = load_roster()
-        st.caption("Upload a CSV with columns student_id, student_name. Existing IDs will be updated.")
-        uploaded_roster = st.file_uploader("Upload roster CSV", type=["csv"], key="roster_upload")
-        if uploaded_roster is not None:
-            try:
-                roster_file = pd.read_csv(uploaded_roster)
-                if "student_id" not in roster_file.columns or ("student_name" not in roster_file.columns):
-                    st.error("CSV must include 'student_id' and 'student_name' columns.")
+        tab_class_prep, tab_responses, tab_participation, tab_scores, tab_import, tab_backup = st.tabs(
+            [
+                "🗂️ Class preparation",
+                "🧾 Student responses & grading",
+                "⭐ Participation (by date)",
+                "📊 Score overview",
+                "🧑‍🎓 Import student names",
+                "🗃️ Database backup & restore",
+            ]
+        )
+
+        # ----- Tab: Class preparation -----
+        with tab_class_prep:
+            st.markdown("### 🗂️ Activities")
+            activity_options = ["(new activity)"]
+            activity_map = {}
+            for _, row in activities_all.iterrows():
+                label = f"{row['name']} ({safe_date_label(row['activity_date'])})"
+                activity_options.append(label)
+                activity_map[label] = row
+            selected_activity_label = st.selectbox("Select activity to edit", options=activity_options)
+            selected_activity_row = activity_map.get(selected_activity_label)
+            default_date = today_th()
+            if selected_activity_row is not None and selected_activity_row["activity_date"]:
+                try:
+                    default_date = datetime.strptime(selected_activity_row["activity_date"], "%Y-%m-%d").date()
+                except ValueError:
+                    default_date = today_th()
+            submitted = False
+            if selected_activity_row is not None and is_free_response_activity(selected_activity_row["id"]):
+                st.info("The free response activity is managed by the system and cannot be edited here.")
+            else:
+                with st.form("activity_form"):
+                    name_val = st.text_input(
+                        "Activity name",
+                        value=selected_activity_row["name"] if selected_activity_row is not None else "",
+                    )
+                    date_val = st.date_input(
+                        "Activity date",
+                        value=default_date,
+                    )
+                    assignment_val = st.selectbox(
+                        "Assignment type",
+                        options=ASSIGNMENT_TYPES,
+                        index=ASSIGNMENT_TYPES.index(
+                            selected_activity_row["assignment_type"]
+                        )
+                        if selected_activity_row is not None
+                        and selected_activity_row["assignment_type"] in ASSIGNMENT_TYPES
+                        else 0,
+                    )
+                    description_default = ""
+                    if selected_activity_row is not None and pd.notna(selected_activity_row["description"]):
+                        description_default = str(selected_activity_row["description"])
+                    description_val = st.text_area(
+                        "Description",
+                        value=description_default,
+                    )
+                    active_val = st.checkbox(
+                        "Active (visible to students)",
+                        value=bool(selected_activity_row["active"]) if selected_activity_row is not None else True,
+                    )
+                    submitted = st.form_submit_button("Save Activity")
+            if submitted:
+                if not name_val.strip():
+                    st.error("Activity name is required.")
                 else:
-                    records = []
-                    for _, row in roster_file.iterrows():
-                        sid = str(row.get("student_id", "")).strip()
-                        sname = str(row.get("student_name", "")).strip()
-                        if sid and sname:
-                            records.append((sid, sname))
-                    if records:
-                        upsert_roster(records)
-                        st.success(f"Imported {len(records)} roster entries.")
-                        roster_df = load_roster()
-                    else:
-                        st.warning("No valid rows found to import.")
-            except Exception as exc:
-                st.error(f"Unable to read roster CSV: {exc}")
-        if roster_df.empty:
-            st.info("No roster loaded yet.")
-        else:
-            st.dataframe(roster_df, use_container_width=True, hide_index=True)
+                    save_activity(
+                        selected_activity_row["id"] if selected_activity_row is not None else None,
+                        name_val,
+                        date_val,
+                        assignment_val,
+                        description_val,
+                        active_val,
+                    )
+                    st.success("Activity saved.")
+                    activities_all = get_activities(active_only=False)
 
-        # Activity builder
-        st.divider()
-        st.markdown("### 🗂️ Activities")
-        activity_options = ["(new activity)"]
-        activity_map = {}
-        for _, row in activities_all.iterrows():
-            label = f"{row['name']} ({safe_date_label(row['activity_date'])})"
-            activity_options.append(label)
-            activity_map[label] = row
-        selected_activity_label = st.selectbox("Select activity to edit", options=activity_options)
-        selected_activity_row = activity_map.get(selected_activity_label)
-        default_date = today_th()
-        if selected_activity_row is not None and selected_activity_row["activity_date"]:
-            try:
-                default_date = datetime.strptime(selected_activity_row["activity_date"], "%Y-%m-%d").date()
-            except ValueError:
-                default_date = today_th()
-        with st.form("activity_form"):
-            name_val = st.text_input(
-                "Activity name",
-                value=selected_activity_row["name"] if selected_activity_row is not None else "",
-            )
-            date_val = st.date_input(
-                "Activity date",
-                value=default_date,
-            )
-            assignment_val = st.selectbox(
-                "Assignment type",
-                options=ASSIGNMENT_TYPES,
-                index=ASSIGNMENT_TYPES.index(
-                    selected_activity_row["assignment_type"]
-                )
-                if selected_activity_row is not None
-                and selected_activity_row["assignment_type"] in ASSIGNMENT_TYPES
-                else 0,
-            )
-            description_default = ""
-            if selected_activity_row is not None and pd.notna(selected_activity_row["description"]):
-                description_default = str(selected_activity_row["description"])
-            description_val = st.text_area(
-                "Description",
-                value=description_default,
-            )
-            active_val = st.checkbox(
-                "Active (visible to students)",
-                value=bool(selected_activity_row["active"]) if selected_activity_row is not None else True,
-            )
-            submitted = st.form_submit_button("Save Activity")
-        if submitted:
-            if not name_val.strip():
-                st.error("Activity name is required.")
-            else:
-                save_activity(
-                    selected_activity_row["id"] if selected_activity_row is not None else None,
-                    name_val,
-                    date_val,
-                    assignment_val,
-                    description_val,
-                    active_val,
-                )
-                st.success("Activity saved.")
-                activities_all = get_activities(active_only=False)
-
-        st.dataframe(
-            activities_all,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        # Question management
-        st.markdown("### 📝 Manage questions per activity")
-        if activities_all.empty:
-            st.info("Create an activity first.")
-        else:
-            activity_id_for_questions = activity_select(
-                "Choose activity for questions",
+            st.dataframe(
                 activities_all,
-                key="question_activity_select",
-            )
-            if activity_id_for_questions is None:
-                st.info("No activity available.")
-            else:
-                builder_records = list(get_question_builder(activity_id_for_questions))
-                count_key = f"question_count_{activity_id_for_questions}"
-                cache_key = f"{count_key}_cache"
-                current_count = st.session_state.get(
-                    count_key,
-                    st.session_state.get(cache_key, len(builder_records) or 1),
-                )
-                num_questions = st.number_input(
-                    "Number of questions",
-                    min_value=1,
-                    max_value=50,
-                    value=int(current_count) or 1,
-                    step=1,
-                    key=count_key,
-                )
-                num_questions = int(num_questions)
-                if num_questions > len(builder_records):
-                    for _ in range(num_questions - len(builder_records)):
-                        builder_records.append(blank_question_template(len(builder_records) + 1))
-                elif num_questions < len(builder_records):
-                    for drop_idx in range(num_questions, len(builder_records)):
-                        prefix = f"question_editor_{activity_id_for_questions}_{drop_idx}_"
-                        st.session_state.pop(f"{prefix}text", None)
-                        st.session_state.pop(f"{prefix}type", None)
-                        st.session_state.pop(f"{prefix}options", None)
-                    builder_records = builder_records[:num_questions]
-                for idx, record in enumerate(builder_records):
-                    record["question_no"] = idx + 1
-                set_question_builder(activity_id_for_questions, builder_records)
-
-                updated_records = []
-                for idx, record in enumerate(builder_records):
-                    st.markdown(f"**Question {idx + 1}**")
-                    text_key = f"question_editor_{activity_id_for_questions}_{idx}_text"
-                    type_key = f"question_editor_{activity_id_for_questions}_{idx}_type"
-                    options_key = f"question_editor_{activity_id_for_questions}_{idx}_options"
-
-                    text_val = st.text_input(
-                        "Question text",
-                        value=record.get("question", ""),
-                        key=text_key,
-                    )
-                    type_options = list(QUESTION_RESPONSE_TYPES.keys())
-                    type_default = normalize_response_type(record.get("response_type"))
-                    type_index = type_options.index(type_default) if type_default in type_options else 0
-                    type_val = st.selectbox(
-                        "Response type",
-                        options=type_options,
-                        format_func=lambda opt: QUESTION_RESPONSE_TYPES.get(opt, opt),
-                        index=type_index,
-                        key=type_key,
-                    )
-                    opts_list = record.get("options", [])
-                    if type_val == "multiple_choice":
-                        options_text = st.text_area(
-                            "Choices (one per line)",
-                            value="\n".join(opts_list),
-                            key=options_key,
-                            help="Students will select exactly one of these choices.",
-                        )
-                        parsed_options = [opt.strip() for opt in options_text.splitlines() if opt.strip()]
-                    else:
-                        st.session_state.pop(options_key, None)
-                        parsed_options = []
-                    updated_records.append(
-                        {
-                            "id": record.get("id"),
-                            "question_no": idx + 1,
-                            "question": text_val,
-                            "response_type": type_val,
-                            "options": parsed_options,
-                        }
-                    )
-                set_question_builder(activity_id_for_questions, updated_records)
-
-                col_save_q, col_reset_q, col_reload_q = st.columns(3)
-                with col_save_q:
-                    if st.button("💾 Save Question Set", use_container_width=True):
-                        save_question_set(activity_id_for_questions, updated_records)
-                        st.success("Questions saved.")
-                with col_reset_q:
-                    if st.button("Reset to defaults", use_container_width=True):
-                        set_question_builder(activity_id_for_questions, default_question_bundle(), reset_inputs=True)
-                        st.info("Defaults loaded. Click Save to persist.")
-                with col_reload_q:
-                    if st.button("📥 Load current saved", use_container_width=True):
-                        set_question_builder(activity_id_for_questions, load_question_bundle(activity_id_for_questions), reset_inputs=True)
-                        st.success("Latest saved questions loaded.")
-
-        # Responses & grading
-        st.markdown("### 🧾 Student responses & grading")
-        if activities_all.empty:
-            st.info("No activities to grade yet.")
-        else:
-            grading_activity_id = activity_select(
-                "Activity to review",
-                activities_all,
-                key="grading_activity_select",
-            )
-            if grading_activity_id is None:
-                st.info("Select or create an activity to review.")
-            else:
-                student_filter = st.text_input("Search Student ID (optional)", key="student_filter")
-                if st.button("Load responses", use_container_width=True):
-                    st.session_state.grading_filter = {
-                        "activity_id": grading_activity_id,
-                        "student": student_filter,
-                    }
-                    st.session_state.teacher_loaded = True
-
-                if st.session_state.get("grading_filter"):
-                    filt = st.session_state["grading_filter"]
-                    df_responses = load_answers(filt.get("activity_id"), filt.get("student", ""))
-                    if df_responses.empty:
-                        st.info("No responses found for this selection.")
-                    else:
-                        editable = df_responses.copy()
-                        editable["checked"] = editable["checked"].astype(bool)
-                        editable = st.data_editor(
-                            editable,
-                            column_config={
-                                "checked": st.column_config.CheckboxColumn("Checked?"),
-                                "score": st.column_config.NumberColumn(
-                                    "Score", min_value=0.0, step=0.5, format="%.2f"
-                                ),
-                                "question_no": st.column_config.NumberColumn("Question #"),
-                                "group_name": st.column_config.TextColumn("Group"),
-                                "student_name": st.column_config.TextColumn("Student Name"),
-                            },
-                            disabled=[
-                                "id",
-                                "student_id",
-                                "group_name",
-                                "activity_id",
-                                "activity_name",
-                                "question",
-                                "answer",
-                            ],
-                            hide_index=True,
-                            use_container_width=True,
-                            key="responses_editor",
-                        )
-                        changes = []
-                        for idx in range(len(df_responses)):
-                            base = df_responses.iloc[idx]
-                            new = editable.iloc[idx]
-                            base_score = base["score"]
-                            new_score = new["score"]
-                            if pd.isna(base_score) and pd.isna(new_score):
-                                score_changed = False
-                            else:
-                                score_changed = base_score != new_score
-                            checked_changed = bool(base["checked"]) != bool(new["checked"])
-                            if score_changed or checked_changed:
-                                changes.append(
-                                    {
-                                        "id": int(new["id"]),
-                                        "score": None if pd.isna(new_score) else float(new_score),
-                                        "checked": bool(new["checked"]),
-                                    }
-                                )
-                        col_grade_save, col_grade_mark = st.columns(2)
-                        with col_grade_save:
-                            if st.button("💾 Save grades/checks", use_container_width=True, disabled=not changes):
-                                update_scores(changes)
-                                st.success("Grades updated.")
-                        with col_grade_mark:
-                            if st.button("☑️ Mark all checked", use_container_width=True):
-                                update_checked(editable["id"].tolist(), True)
-                                st.success("All answers marked as checked.")
-
-        # Participation & export
-        st.markdown("### ⭐ Participation (by date)")
-        participation_date = st.date_input(
-            "Participation date",
-            value=today_th(),
-            key="participation_date_input",
-        )
-        participation_date_str = participation_date.isoformat()
-        checkins_for_date = load_check_ins(participation_date_str)
-        if checkins_for_date.empty:
-            st.info("No student check-ins for this date yet.")
-        else:
-            st.caption("Students who checked in on this date:")
-            daily_df = get_daily_participation(participation_date_str)
-            display_daily = daily_df.rename(
-                columns={
-                    "student_id": "Student ID",
-                    "student_name": "Student Name",
-                    "note": "Student note",
-                    "check_in_date": "Check-in date",
-                    "recorded_at": "Checked-in at",
-                    "participation_points": "Participation points",
-                    "teacher_note": "Teacher note",
-                }
-            )
-            editable_daily = st.data_editor(
-                display_daily,
-                column_config={
-                    "Participation points": st.column_config.NumberColumn("Participation points", min_value=0.0, step=0.5),
-                    "Teacher note": st.column_config.TextColumn("Teacher note"),
-                },
-                disabled=["Student ID", "Student note", "Check-in date", "Checked-in at"],
-                hide_index=True,
                 use_container_width=True,
-                key="daily_participation_editor",
+                hide_index=True,
             )
-            if st.button("💾 Save daily participation", use_container_width=True):
-                revert_daily = editable_daily.rename(
+
+            st.markdown("### 📝 Manage questions per activity")
+            question_activities = activities_all
+            if FREE_RESPONSE_ACTIVITY_ID is not None and not activities_all.empty:
+                question_activities = activities_all[activities_all["id"] != FREE_RESPONSE_ACTIVITY_ID]
+            if question_activities.empty:
+                st.info("Create an activity first.")
+            else:
+                activity_id_for_questions = activity_select(
+                    "Choose activity for questions",
+                    question_activities,
+                    key="question_activity_select",
+                )
+                if activity_id_for_questions is None:
+                    st.info("No activity available.")
+                else:
+                    builder_records = list(get_question_builder(activity_id_for_questions))
+                    count_key = f"question_count_{activity_id_for_questions}"
+                    cache_key = f"{count_key}_cache"
+                    current_count = st.session_state.get(
+                        count_key,
+                        st.session_state.get(cache_key, len(builder_records) or 1),
+                    )
+                    num_questions = st.number_input(
+                        "Number of questions",
+                        min_value=1,
+                        max_value=50,
+                        value=int(current_count) or 1,
+                        step=1,
+                        key=count_key,
+                    )
+                    num_questions = int(num_questions)
+                    if num_questions > len(builder_records):
+                        for _ in range(num_questions - len(builder_records)):
+                            builder_records.append(blank_question_template(len(builder_records) + 1))
+                    elif num_questions < len(builder_records):
+                        for drop_idx in range(num_questions, len(builder_records)):
+                            prefix = f"question_editor_{activity_id_for_questions}_{drop_idx}_"
+                            st.session_state.pop(f"{prefix}text", None)
+                            st.session_state.pop(f"{prefix}type", None)
+                            st.session_state.pop(f"{prefix}options", None)
+                        builder_records = builder_records[:num_questions]
+                    for idx, record in enumerate(builder_records):
+                        record["question_no"] = idx + 1
+                    set_question_builder(activity_id_for_questions, builder_records)
+
+                    updated_records = []
+                    for idx, record in enumerate(builder_records):
+                        st.markdown(f"**Question {idx + 1}**")
+                        text_key = f"question_editor_{activity_id_for_questions}_{idx}_text"
+                        type_key = f"question_editor_{activity_id_for_questions}_{idx}_type"
+                        options_key = f"question_editor_{activity_id_for_questions}_{idx}_options"
+
+                        text_val = st.text_input(
+                            "Question text",
+                            value=record.get("question", ""),
+                            key=text_key,
+                        )
+                        type_options = list(QUESTION_RESPONSE_TYPES.keys())
+                        type_default = normalize_response_type(record.get("response_type"))
+                        type_index = type_options.index(type_default) if type_default in type_options else 0
+                        type_val = st.selectbox(
+                            "Response type",
+                            options=type_options,
+                            format_func=lambda opt: QUESTION_RESPONSE_TYPES.get(opt, opt),
+                            index=type_index,
+                            key=type_key,
+                        )
+                        opts_list = record.get("options", [])
+                        if type_val == "multiple_choice":
+                            options_text = st.text_area(
+                                "Choices (one per line)",
+                                value="\n".join(opts_list),
+                                key=options_key,
+                                help="Students will select exactly one of these choices.",
+                            )
+                            parsed_options = [opt.strip() for opt in options_text.splitlines() if opt.strip()]
+                        else:
+                            st.session_state.pop(options_key, None)
+                            parsed_options = []
+                        updated_records.append(
+                            {
+                                "id": record.get("id"),
+                                "question_no": idx + 1,
+                                "question": text_val,
+                                "response_type": type_val,
+                                "options": parsed_options,
+                            }
+                        )
+                    set_question_builder(activity_id_for_questions, updated_records)
+
+                    col_save_q, col_reset_q, col_reload_q = st.columns(3)
+                    with col_save_q:
+                        if st.button("💾 Save Question Set", use_container_width=True):
+                            save_question_set(activity_id_for_questions, updated_records)
+                            st.success("Questions saved.")
+                    with col_reset_q:
+                        if st.button("Reset to defaults", use_container_width=True):
+                            set_question_builder(activity_id_for_questions, default_question_bundle(), reset_inputs=True)
+                            st.info("Defaults loaded. Click Save to persist.")
+                    with col_reload_q:
+                        if st.button("📥 Load current saved", use_container_width=True):
+                            set_question_builder(
+                                activity_id_for_questions, load_question_bundle(activity_id_for_questions), reset_inputs=True
+                            )
+                            st.success("Latest saved questions loaded.")
+
+        # ----- Tab: Student responses & grading -----
+        with tab_responses:
+            st.markdown("### 🧾 Student responses & grading")
+            if activities_all.empty:
+                st.info("No activities to grade yet.")
+            else:
+                grading_activity_id = activity_select(
+                    "Activity to review",
+                    activities_all,
+                    key="grading_activity_select",
+                )
+                if grading_activity_id is None:
+                    st.info("Select or create an activity to review.")
+                else:
+                    student_filter = st.text_input("Search Student ID (optional)", key="student_filter")
+                    if st.button("Load responses", use_container_width=True):
+                        st.session_state.grading_filter = {
+                            "activity_id": grading_activity_id,
+                            "student": student_filter,
+                        }
+                        st.session_state.teacher_loaded = True
+
+                    if st.session_state.get("grading_filter"):
+                        filt = st.session_state["grading_filter"]
+                        df_responses = load_answers(filt.get("activity_id"), filt.get("student", ""))
+                        if df_responses.empty:
+                            st.info("No responses found for this selection.")
+                        else:
+                            editable = df_responses.copy()
+                            editable["checked"] = editable["checked"].astype(bool)
+                            editable = st.data_editor(
+                                editable,
+                                column_config={
+                                    "checked": st.column_config.CheckboxColumn("Checked?"),
+                                    "score": st.column_config.NumberColumn(
+                                        "Score", min_value=0.0, step=0.5, format="%.2f"
+                                    ),
+                                    "question_no": st.column_config.NumberColumn("Question #"),
+                                    "group_name": st.column_config.TextColumn("Group"),
+                                    "student_name": st.column_config.TextColumn("Student Name"),
+                                },
+                                disabled=[
+                                    "id",
+                                    "student_id",
+                                    "group_name",
+                                    "activity_id",
+                                    "activity_name",
+                                    "question",
+                                    "answer",
+                                ],
+                                hide_index=True,
+                                use_container_width=True,
+                                key="responses_editor",
+                            )
+                            changes = []
+                            for idx in range(len(df_responses)):
+                                base = df_responses.iloc[idx]
+                                new = editable.iloc[idx]
+                                base_score = base["score"]
+                                new_score = new["score"]
+                                if pd.isna(base_score) and pd.isna(new_score):
+                                    score_changed = False
+                                else:
+                                    score_changed = base_score != new_score
+                                checked_changed = bool(base["checked"]) != bool(new["checked"])
+                                if score_changed or checked_changed:
+                                    changes.append(
+                                        {
+                                            "id": int(new["id"]),
+                                            "score": None if pd.isna(new_score) else float(new_score),
+                                            "checked": bool(new["checked"]),
+                                        }
+                                    )
+                            col_grade_save, col_grade_mark = st.columns(2)
+                            with col_grade_save:
+                                if st.button("💾 Save grades/checks", use_container_width=True, disabled=not changes):
+                                    update_scores(changes)
+                                    st.success("Grades updated.")
+                            with col_grade_mark:
+                                if st.button("☑️ Mark all checked", use_container_width=True):
+                                    update_checked(editable["id"].tolist(), True)
+                                    st.success("All answers marked as checked.")
+
+        # ----- Tab: Participation -----
+        with tab_participation:
+            st.markdown("### ⭐ Participation (by date)")
+            participation_date = st.date_input(
+                "Participation date",
+                value=today_th(),
+                key="participation_date_input",
+            )
+            participation_date_str = participation_date.isoformat()
+            checkins_for_date = load_check_ins(participation_date_str)
+            if checkins_for_date.empty:
+                st.info("No student check-ins for this date yet.")
+            else:
+                st.caption("Students who checked in on this date:")
+                daily_df = get_daily_participation(participation_date_str)
+                daily_df = apply_daily_participation_adjustments(daily_df, participation_date_str)
+                display_daily = daily_df.rename(
                     columns={
-                        "Student ID": "student_id",
-                        "Participation points": "participation_points",
-                        "Teacher note": "teacher_note",
+                        "student_id": "Student ID",
+                        "student_name": "Student Name",
+                        "note": "Student note",
+                        "check_in_date": "Check-in date",
+                        "recorded_at": "Checked-in at",
+                        "participation_points": "Participation points",
+                        "teacher_note": "Teacher note",
                     }
                 )
-                save_daily_participation(participation_date_str, revert_daily[["student_id", "participation_points", "teacher_note"]])
-                st.success("Participation points saved for this date.")
-
-        st.markdown("### 📊 Gradebook & exports (by activity)")
-        if activities_all.empty:
-            st.info("No activities available.")
-        else:
-            participation_activity_id = activity_select(
-                "Activity for gradebook/export",
-                activities_all,
-                key="participation_activity_select",
-            )
-            if participation_activity_id is None:
-                st.info("Select an activity to continue.")
-            else:
-                summary_df = get_participation(participation_activity_id)
-                if summary_df.empty:
-                    st.info("No graded responses available for this activity.")
-                else:
-                    summary_df_display = summary_df[
-                        ["student_id", "total_score", "participation_points", "overall_grade", "calculated_grade"]
-                    ]
-                    summary_df_display = summary_df_display.rename(
-                        columns={
-                            "student_id": "Student ID",
-                            "total_score": "Score",
-                            "participation_points": "Participation",
-                            "overall_grade": "Final grade",
-                            "calculated_grade": "Score + participation",
-                        }
-                    )
-                    edited_summary = st.data_editor(
-                        summary_df_display,
-                        column_config={
-                            "Participation": st.column_config.NumberColumn("Participation", min_value=0.0, step=0.5),
-                            "Final grade": st.column_config.NumberColumn("Final grade", min_value=0.0, step=0.5),
-                        },
-                        hide_index=True,
-                        use_container_width=True,
-                        key="participation_editor",
-                    )
-                    revert_df = edited_summary.rename(
+                editable_daily = st.data_editor(
+                    display_daily,
+                    column_config={
+                        "Participation points": st.column_config.NumberColumn("Participation points", min_value=0.0, step=0.5),
+                        "Teacher note": st.column_config.TextColumn("Teacher note"),
+                    },
+                    disabled=["Student ID", "Student note", "Check-in date", "Checked-in at"],
+                    hide_index=True,
+                    use_container_width=True,
+                    key="daily_participation_editor",
+                )
+                st.caption("Use +/- buttons for quick adjustments, then press Save to persist.")
+                for idx, row in editable_daily.iterrows():
+                    student_id = row.get("Student ID", "")
+                    student_name = row.get("Student Name", "") or "Unnamed"
+                    current_points = row.get("Participation points", 0.0) or 0.0
+                    col_label, col_minus, col_plus = st.columns([6, 1, 1])
+                    with col_label:
+                        st.write(f"{student_id} · {student_name} — {current_points:.2f} pts")
+                    with col_minus:
+                        if st.button("➖", key=f"participation_minus_{participation_date_str}_{student_id}"):
+                            adjust_daily_score(participation_date_str, str(student_id), -PARTICIPATION_STEP)
+                            st.rerun()
+                    with col_plus:
+                        if st.button("➕", key=f"participation_plus_{participation_date_str}_{student_id}"):
+                            adjust_daily_score(participation_date_str, str(student_id), PARTICIPATION_STEP)
+                            st.rerun()
+                if st.button("💾 Save daily participation", use_container_width=True):
+                    revert_daily = editable_daily.rename(
                         columns={
                             "Student ID": "student_id",
-                            "Score": "total_score",
-                            "Participation": "participation_points",
-                            "Final grade": "overall_grade",
-                            "Score + participation": "calculated_grade",
+                            "Participation points": "participation_points",
+                            "Teacher note": "teacher_note",
                         }
                     )
-                    if st.button("💾 Save participation / final grades", use_container_width=True):
-                        save_participation(
-                            participation_activity_id, revert_df[["student_id", "participation_points", "overall_grade"]]
-                        )
-                        st.success("Participation saved.")
+                    save_daily_participation(
+                        participation_date_str, revert_daily[["student_id", "participation_points", "teacher_note"]]
+                    )
+                    adjustments = st.session_state.get("daily_participation_adjust", {})
+                    st.session_state["daily_participation_adjust"] = {
+                        key: val for key, val in adjustments.items() if not key.startswith(f"{participation_date_str}|")
+                    }
+                    st.success("Participation points saved for this date.")
 
-                    responses_df, summary_export = build_gradebook(participation_activity_id)
-                    if not responses_df.empty:
-                        if HAS_XLSXWRITER:
-                            output = io.BytesIO()
-                            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:  # type: ignore[arg-type]
-                                responses_df.to_excel(writer, sheet_name="Responses", index=False)
-                                summary_export.to_excel(writer, sheet_name="Summary", index=False)
-                            st.download_button(
-                                "⬇️ Export gradebook (.xlsx)",
-                                data=output.getvalue(),
-                                file_name=f"gradebook_activity_{participation_activity_id}.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                use_container_width=True,
-                            )
-                        else:
-                            st.warning(
-                                "Install the optional dependency `xlsxwriter` (see requirements.txt) to enable Excel exports."
-                            )
-
-        backup_bytes = backup_database()
-        st.download_button(
-            "💾 Download DB backup",
-            data=backup_bytes,
-            file_name=f"answers_backup_{today_th().isoformat()}.db",
-            mime="application/x-sqlite3",
-            use_container_width=True,
-        )
-        with st.expander("⚠️ Restore database from backup"):
-            st.warning(
-                "Restoring will overwrite the current database. A safety copy (.bak_YYYYMMDDHHMMSS) will be kept."
-            )
-            uploaded_db = st.file_uploader("Upload .db backup file", type=["db", "sqlite"], accept_multiple_files=False)
-            if uploaded_db is not None:
-                success, msg = restore_database(uploaded_db.read())
-                if success:
-                    st.success(msg)
+        # ----- Tab: Score overview -----
+        with tab_scores:
+            st.markdown("### 📊 Gradebook & exports (by activity)")
+            if activities_all.empty:
+                st.info("No activities available.")
+            else:
+                participation_activity_id = activity_select(
+                    "Activity for gradebook/export",
+                    activities_all,
+                    key="participation_activity_select",
+                )
+                if participation_activity_id is None:
+                    st.info("Select an activity to continue.")
                 else:
-                    st.error(msg)
+                    summary_df = get_participation(participation_activity_id)
+                    if summary_df.empty:
+                        st.info("No graded responses available for this activity.")
+                    else:
+                        summary_df_display = summary_df[
+                            ["student_id", "total_score", "participation_points", "overall_grade", "calculated_grade"]
+                        ]
+                        summary_df_display = summary_df_display.rename(
+                            columns={
+                                "student_id": "Student ID",
+                                "total_score": "Score",
+                                "participation_points": "Participation",
+                                "overall_grade": "Final grade",
+                                "calculated_grade": "Score + participation",
+                            }
+                        )
+                        edited_summary = st.data_editor(
+                            summary_df_display,
+                            column_config={
+                                "Participation": st.column_config.NumberColumn("Participation", min_value=0.0, step=0.5),
+                                "Final grade": st.column_config.NumberColumn("Final grade", min_value=0.0, step=0.5),
+                            },
+                            hide_index=True,
+                            use_container_width=True,
+                            key="participation_editor",
+                        )
+                        revert_df = edited_summary.rename(
+                            columns={
+                                "Student ID": "student_id",
+                                "Score": "total_score",
+                                "Participation": "participation_points",
+                                "Final grade": "overall_grade",
+                                "Score + participation": "calculated_grade",
+                            }
+                        )
+                        if st.button("💾 Save participation / final grades", use_container_width=True):
+                            save_participation(
+                                participation_activity_id, revert_df[["student_id", "participation_points", "overall_grade"]]
+                            )
+                            st.success("Participation saved.")
+
+                        responses_df, summary_export = build_gradebook(participation_activity_id)
+                        if not responses_df.empty:
+                            if HAS_XLSXWRITER:
+                                output = io.BytesIO()
+                                with pd.ExcelWriter(output, engine="xlsxwriter") as writer:  # type: ignore[arg-type]
+                                    responses_df.to_excel(writer, sheet_name="Responses", index=False)
+                                    summary_export.to_excel(writer, sheet_name="Summary", index=False)
+                                st.download_button(
+                                    "⬇️ Export gradebook (.xlsx)",
+                                    data=output.getvalue(),
+                                    file_name=f"gradebook_activity_{participation_activity_id}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    use_container_width=True,
+                                )
+                            else:
+                                st.warning(
+                                    "Install the optional dependency `xlsxwriter` (see requirements.txt) to enable Excel exports."
+                                )
+
+        # ----- Tab: Import student names -----
+        with tab_import:
+            st.markdown("### 🧑‍🎓 Student roster (IDs → names)")
+            roster_df = load_roster()
+            st.caption("Upload a CSV with columns student_id, student_name. Existing IDs will be updated.")
+            uploaded_roster = st.file_uploader("Upload roster CSV", type=["csv"], key="roster_upload")
+            if uploaded_roster is not None:
+                try:
+                    roster_file = pd.read_csv(uploaded_roster)
+                    if "student_id" not in roster_file.columns or ("student_name" not in roster_file.columns):
+                        st.error("CSV must include 'student_id' and 'student_name' columns.")
+                    else:
+                        records = []
+                        for _, row in roster_file.iterrows():
+                            sid = str(row.get("student_id", "")).strip()
+                            sname = str(row.get("student_name", "")).strip()
+                            if sid and sname:
+                                records.append((sid, sname))
+                        if records:
+                            upsert_roster(records)
+                            st.success(f"Imported {len(records)} roster entries.")
+                            roster_df = load_roster()
+                        else:
+                            st.warning("No valid rows found to import.")
+                except Exception as exc:
+                    st.error(f"Unable to read roster CSV: {exc}")
+            if roster_df.empty:
+                st.info("No roster loaded yet.")
+            else:
+                st.dataframe(roster_df, use_container_width=True, hide_index=True)
+
+        # ----- Tab: Database backup -----
+        with tab_backup:
+            st.markdown("### 🗃️ Database backup & restore")
+            backup_bytes = backup_database()
+            st.download_button(
+                "💾 Download DB backup",
+                data=backup_bytes,
+                file_name=f"answers_backup_{today_th().isoformat()}.db",
+                mime="application/x-sqlite3",
+                use_container_width=True,
+            )
+            with st.expander("⚠️ Restore database from backup"):
+                st.warning(
+                    "Restoring will overwrite the current database. A safety copy (.bak_YYYYMMDDHHMMSS) will be kept."
+                )
+                uploaded_db = st.file_uploader("Upload .db backup file", type=["db", "sqlite"], accept_multiple_files=False)
+                if uploaded_db is not None:
+                    success, msg = restore_database(uploaded_db.read())
+                    if success:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
