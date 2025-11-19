@@ -381,6 +381,29 @@ def save_activity(activity_id, name, activity_date, assignment_type, description
     con.close()
 
 
+def delete_activity(activity_id: int | None):
+    if not activity_id:
+        return
+    if is_free_response_activity(activity_id):
+        return
+    con = get_con()
+    cur = con.cursor()
+    cur.execute("SELECT DISTINCT student_id FROM student_activity WHERE activity_id=?", (activity_id,))
+    students = [row[0] for row in cur.fetchall()]
+    cur.execute("DELETE FROM questions WHERE activity_id=?", (activity_id,))
+    cur.execute("DELETE FROM answers WHERE activity_id=?", (activity_id,))
+    cur.execute("DELETE FROM student_activity WHERE activity_id=?", (activity_id,))
+    if students:
+        placeholders = ",".join(["?"] * len(students))
+        cur.execute(
+            f"DELETE FROM participation_daily WHERE student_id IN ({placeholders})",
+            students,
+        )
+    cur.execute("DELETE FROM activities WHERE id=?", (activity_id,))
+    con.commit()
+    con.close()
+
+
 def load_question_bundle(activity_id: int | None):
     if not activity_id:
         return default_question_bundle()
@@ -492,20 +515,35 @@ def save_answers(student_id, activity_id, qa_list, group_name=""):
     )
     con = get_con()
     cur = con.cursor()
-    cur.execute("DELETE FROM answers WHERE student_id=? AND activity_id=?", (student_id, activity_id))
-    for item in qa_list:
+    free_mode = is_free_response_activity(activity_id)
+    student_id_clean = student_id.strip()
+    if free_mode:
+        cur.execute(
+            "SELECT COALESCE(MAX(question_no), 0) FROM answers WHERE student_id=? AND activity_id=?",
+            (student_id_clean, activity_id),
+        )
+        start_offset = int(cur.fetchone()[0] or 0)
+    else:
+        cur.execute("DELETE FROM answers WHERE student_id=? AND activity_id=?", (student_id_clean, activity_id))
+        start_offset = 0
+    for idx, item in enumerate(qa_list, start=1):
+        q_no = item.get("question_no")
+        if not isinstance(q_no, int) or q_no <= 0:
+            q_no = idx
+        if free_mode:
+            q_no = start_offset + q_no
         cur.execute(
             """
             INSERT INTO answers (student_id, group_name, activity_id, date_week, question_id, question_no, question, answer, checked, score)
             VALUES (?,?,?,?,?,?,?,?,0,NULL)
             """,
             (
-                student_id.strip(),
+                student_id_clean,
                 group_name.strip() or None,
                 activity_id,
                 activity_label,
                 item.get("question_id"),
-                item.get("question_no"),
+                q_no,
                 item.get("question"),
                 item.get("answer"),
             ),
@@ -739,6 +777,13 @@ def get_daily_participation(check_in_date: str):
     return df
 
 
+def load_all_checkin_students():
+    con = get_con()
+    df = pd.read_sql_query("SELECT DISTINCT student_id FROM check_ins", con)
+    con.close()
+    return df
+
+
 def save_daily_participation(check_in_date: str, records: pd.DataFrame):
     if records.empty:
         return
@@ -860,6 +905,34 @@ def attach_names(df: pd.DataFrame):
         merged["student_name"] = merged.get("student_name_x").combine_first(merged.get("student_name_y"))
         merged = merged.drop(columns=["student_name_x", "student_name_y"], errors="ignore")
     return merged
+
+
+def load_all_daily_participation_totals():
+    con = get_con()
+    df = pd.read_sql_query(
+        """
+        SELECT student_id, SUM(COALESCE(participation_points,0)) AS daily_points
+        FROM participation_daily
+        GROUP BY student_id
+        """,
+        con,
+    )
+    con.close()
+    return df
+
+
+def load_participation_daily_entries():
+    con = get_con()
+    df = pd.read_sql_query(
+        """
+        SELECT student_id, check_in_date, participation_points, teacher_note
+        FROM participation_daily
+        ORDER BY check_in_date DESC
+        """,
+        con,
+    )
+    con.close()
+    return df
 
 
 def adjust_daily_score(check_in_date: str, student_id: str, delta: float):
@@ -1118,6 +1191,7 @@ st.session_state.setdefault("nav_warning", "")
 st.session_state.setdefault("daily_participation_adjust", {})
 st.session_state.setdefault("free_response_mode", False)
 st.session_state.setdefault("free_response_entries", [])
+st.session_state.setdefault("all_responses_table", None)
 
 st.title("📚 Student Activity Response Collector")
 tab_student, tab_teacher = st.tabs(["👩‍🎓 Student", "👨‍🏫 Teacher"])
@@ -1383,6 +1457,10 @@ with tab_teacher:
                 except ValueError:
                     default_date = today_th()
             submitted = False
+            delete_requested = False
+            can_delete_activity = selected_activity_row is not None and not is_free_response_activity(
+                selected_activity_row["id"] if selected_activity_row is not None else None
+            )
             if selected_activity_row is not None and is_free_response_activity(selected_activity_row["id"]):
                 st.info("The free response activity is managed by the system and cannot be edited here.")
             else:
@@ -1416,8 +1494,17 @@ with tab_teacher:
                         "Active (visible to students)",
                         value=bool(selected_activity_row["active"]) if selected_activity_row is not None else True,
                     )
-                    submitted = st.form_submit_button("Save Activity")
-            if submitted:
+                    col_save, col_delete = st.columns([1, 1])
+                    submitted = col_save.form_submit_button("Save Activity")
+                    if can_delete_activity:
+                        delete_requested = col_delete.form_submit_button("🗑️ Delete this activity")
+                    else:
+                        col_delete.write("")
+            if delete_requested:
+                delete_activity(selected_activity_row["id"])
+                st.success("Activity deleted.")
+                activities_all = get_activities(active_only=False)
+            elif submitted:
                 if not name_val.strip():
                     st.error("Activity name is required.")
                 else:
@@ -1528,21 +1615,9 @@ with tab_teacher:
                         )
                     set_question_builder(activity_id_for_questions, updated_records)
 
-                    col_save_q, col_reset_q, col_reload_q = st.columns(3)
-                    with col_save_q:
-                        if st.button("💾 Save Question Set", use_container_width=True):
-                            save_question_set(activity_id_for_questions, updated_records)
-                            st.success("Questions saved.")
-                    with col_reset_q:
-                        if st.button("Reset to defaults", use_container_width=True):
-                            set_question_builder(activity_id_for_questions, default_question_bundle(), reset_inputs=True)
-                            st.info("Defaults loaded. Click Save to persist.")
-                    with col_reload_q:
-                        if st.button("📥 Load current saved", use_container_width=True):
-                            set_question_builder(
-                                activity_id_for_questions, load_question_bundle(activity_id_for_questions), reset_inputs=True
-                            )
-                            st.success("Latest saved questions loaded.")
+                    if st.button("💾 Save Question Set", use_container_width=True):
+                        save_question_set(activity_id_for_questions, updated_records)
+                        st.success("Questions saved.")
 
         # ----- Tab: Student responses & grading -----
         with tab_responses:
@@ -1550,34 +1625,40 @@ with tab_teacher:
             if activities_all.empty:
                 st.info("No activities to grade yet.")
             else:
-                grading_activity_id = activity_select(
+                grading_df = activities_all.copy()
+                all_label = "All activities"
+                activity_options = grading_df["id"].tolist()
+                activity_labels = build_activity_label_map(grading_df)
+                activity_choice = st.selectbox(
                     "Activity to review",
-                    activities_all,
+                    options=[all_label, *activity_options],
+                    format_func=lambda x: activity_labels.get(x, all_label) if x != all_label else all_label,
                     key="grading_activity_select",
                 )
-                if grading_activity_id is None:
-                    st.info("Select or create an activity to review.")
-                else:
-                    student_filter = st.text_input("Search Student ID (optional)", key="student_filter")
-                    if st.button("Load responses", use_container_width=True):
-                        st.session_state.grading_filter = {
-                            "activity_id": grading_activity_id,
-                            "student": student_filter,
-                        }
-                        st.session_state.teacher_loaded = True
+                student_filter = st.text_input("Search Student ID (optional)", key="student_filter")
+                if st.button("Load responses", use_container_width=True):
+                    st.session_state.grading_filter = {
+                        "activity_id": None if activity_choice == all_label else activity_choice,
+                        "student": student_filter,
+                        "all": activity_choice == all_label,
+                    }
+                    st.session_state.teacher_loaded = True
 
-                    if st.session_state.get("grading_filter"):
-                        filt = st.session_state["grading_filter"]
-                        df_responses = load_answers(filt.get("activity_id"), filt.get("student", ""))
-                        if df_responses.empty:
-                            st.info("No responses found for this selection.")
-                        else:
-                            editable = df_responses.copy()
-                            editable["checked"] = editable["checked"].astype(bool)
-                            editable = st.data_editor(
-                                editable,
+                if st.session_state.get("grading_filter"):
+                    filt = st.session_state["grading_filter"]
+                    df_responses = load_answers(filt.get("activity_id"), filt.get("student", ""))
+                    if df_responses.empty:
+                        st.info("No responses found for this selection.")
+                    else:
+                        enable_editing = not filt.get("all")
+                        if enable_editing:
+                            base_by_id = df_responses.set_index("id")
+                            editable_display = df_responses.drop(columns=["checked", "activity_id"], errors="ignore")
+                            if "id" in editable_display.columns:
+                                editable_display = editable_display.set_index("id")
+                            editable_result = st.data_editor(
+                                editable_display,
                                 column_config={
-                                    "checked": st.column_config.CheckboxColumn("Checked?"),
                                     "score": st.column_config.NumberColumn(
                                         "Score", min_value=0.0, step=0.5, format="%.2f"
                                     ),
@@ -1586,10 +1667,8 @@ with tab_teacher:
                                     "student_name": st.column_config.TextColumn("Student Name"),
                                 },
                                 disabled=[
-                                    "id",
                                     "student_id",
                                     "group_name",
-                                    "activity_id",
                                     "activity_name",
                                     "question",
                                     "answer",
@@ -1598,34 +1677,32 @@ with tab_teacher:
                                 use_container_width=True,
                                 key="responses_editor",
                             )
+                            editable = editable_result.reset_index().rename(columns={"index": "id"})
                             changes = []
-                            for idx in range(len(df_responses)):
-                                base = df_responses.iloc[idx]
-                                new = editable.iloc[idx]
+                            for _, new in editable.iterrows():
+                                row_id = int(new["id"])
+                                base = base_by_id.loc[row_id]
                                 base_score = base["score"]
                                 new_score = new["score"]
-                                if pd.isna(base_score) and pd.isna(new_score):
-                                    score_changed = False
-                                else:
-                                    score_changed = base_score != new_score
-                                checked_changed = bool(base["checked"]) != bool(new["checked"])
-                                if score_changed or checked_changed:
+                                score_changed = not (
+                                    (pd.isna(base_score) and pd.isna(new_score))
+                                    or base_score == new_score
+                                )
+                                if score_changed:
                                     changes.append(
                                         {
                                             "id": int(new["id"]),
                                             "score": None if pd.isna(new_score) else float(new_score),
-                                            "checked": bool(new["checked"]),
+                                            "checked": bool(base["checked"]),
                                         }
                                     )
-                            col_grade_save, col_grade_mark = st.columns(2)
-                            with col_grade_save:
-                                if st.button("💾 Save grades/checks", use_container_width=True, disabled=not changes):
-                                    update_scores(changes)
-                                    st.success("Grades updated.")
-                            with col_grade_mark:
-                                if st.button("☑️ Mark all checked", use_container_width=True):
-                                    update_checked(editable["id"].tolist(), True)
-                                    st.success("All answers marked as checked.")
+                            if st.button("💾 Save grades", use_container_width=True, disabled=not changes):
+                                update_scores(changes)
+                                st.success("Grades updated.")
+                        else:
+                            display_df = df_responses.drop(columns=["checked", "activity_id", "id"], errors="ignore")
+                            st.dataframe(display_df, hide_index=True, use_container_width=True)
+                            st.info("Score edits are disabled when viewing all activities.")
 
         # ----- Tab: Participation -----
         with tab_participation:
@@ -1647,20 +1724,27 @@ with tab_teacher:
                     columns={
                         "student_id": "Student ID",
                         "student_name": "Student Name",
-                        "note": "Student note",
-                        "check_in_date": "Check-in date",
                         "recorded_at": "Checked-in at",
                         "participation_points": "Participation points",
                         "teacher_note": "Teacher note",
                     }
                 )
+                display_daily = display_daily[
+                    [
+                        "Student ID",
+                        "Student Name",
+                        "Checked-in at",
+                        "Participation points",
+                        "Teacher note",
+                    ]
+                ]
                 editable_daily = st.data_editor(
                     display_daily,
                     column_config={
                         "Participation points": st.column_config.NumberColumn("Participation points", min_value=0.0, step=0.5),
                         "Teacher note": st.column_config.TextColumn("Teacher note"),
                     },
-                    disabled=["Student ID", "Student note", "Check-in date", "Checked-in at"],
+                    disabled=["Student ID", "Student Name", "Checked-in at"],
                     hide_index=True,
                     use_container_width=True,
                     key="daily_participation_editor",
@@ -1700,77 +1784,195 @@ with tab_teacher:
 
         # ----- Tab: Score overview -----
         with tab_scores:
-            st.markdown("### 📊 Gradebook & exports (by activity)")
-            if activities_all.empty:
-                st.info("No activities available.")
+            st.markdown("### 📊 Gradebook & Exports (by student)")
+            student_roster_df = load_roster()
+            if student_roster_df.empty:
+                st.info("No students in roster yet.")
             else:
-                participation_activity_id = activity_select(
-                    "Activity for gradebook/export",
-                    activities_all,
-                    key="participation_activity_select",
+                student_options = ["All students", *student_roster_df["student_id"].tolist()]
+                selected_student = st.selectbox(
+                    "Student ID",
+                    options=student_options,
+                    key="gradebook_student_select",
                 )
-                if participation_activity_id is None:
-                    st.info("Select an activity to continue.")
+                st.caption("Showing per-student totals across all activities.")
+                gradebook_df = pd.DataFrame()
+                summary_display = pd.DataFrame()
+                detail_display = pd.DataFrame()
+                answers_all = load_answers()
+                activities = activities_all["id"].tolist()
+                per_activity = []
+                for act_id in activities:
+                    summary_df = get_participation(act_id)
+                    per_activity.append(summary_df)
+                if per_activity:
+                    gradebook_df = pd.concat(per_activity, ignore_index=True)
+                checkin_students = load_all_checkin_students()
+                checkin_ids = set(checkin_students.get("student_id", pd.Series()).tolist())
+                daily_totals = load_all_daily_participation_totals()
+                daily_ids = set(daily_totals.get("student_id", pd.Series()).tolist())
+                if gradebook_df.empty:
+                    gradebook_df = pd.DataFrame(
+                        columns=["student_id", "student_name", "total_score", "participation_points", "overall_grade"]
+                    )
+                response_ids = set(gradebook_df.get("student_id", pd.Series()).tolist())
+                roster_ids = set(student_roster_df["student_id"].tolist())
+                all_student_ids = roster_ids.union(checkin_ids).union(response_ids).union(daily_ids)
+                if gradebook_df.empty and not all_student_ids:
+                    st.info("No grade data available for this selection yet.")
                 else:
-                    summary_df = get_participation(participation_activity_id)
-                    if summary_df.empty:
-                        st.info("No graded responses available for this activity.")
+                    gradebook_df = gradebook_df.reindex(columns=["student_id", "student_name", "total_score", "participation_points", "overall_grade"])
+                    gradebook_df = attach_names(gradebook_df)
+                    student_summary = (
+                        gradebook_df.groupby(["student_id", "student_name"], dropna=False)
+                        .agg(
+                            total_score=("total_score", "sum"),
+                            participation_points=("participation_points", "sum"),
+                            overall_grade=("overall_grade", "sum"),
+                        )
+                        .reset_index()
+                    )
+                    if not daily_totals.empty:
+                        daily_totals = attach_names(daily_totals)
+                        daily_merge = daily_totals.rename(columns={"student_name": "daily_student_name"})
+                        student_summary = student_summary.merge(daily_merge, on="student_id", how="outer")
+                        if "student_name" not in student_summary.columns:
+                            student_summary["student_name"] = ""
+                        if "daily_student_name" in student_summary.columns:
+                            student_summary["student_name"] = student_summary["student_name"].fillna(
+                                student_summary["daily_student_name"]
+                            )
+                            student_summary = student_summary.drop(columns=["daily_student_name"], errors="ignore")
+                        for col in ("total_score", "participation_points", "overall_grade", "daily_points"):
+                            if col not in student_summary.columns:
+                                student_summary[col] = 0
+                            else:
+                                student_summary[col] = student_summary[col].fillna(0)
+                        student_summary["participation_points"] = student_summary["participation_points"] + student_summary["daily_points"]
+                        student_summary = student_summary.drop(columns=["daily_points"], errors="ignore")
+                    existing_ids = student_summary["student_id"].tolist() if "student_id" in student_summary.columns else []
+                    missing_ids = [sid for sid in all_student_ids if sid not in existing_ids]
+                    if missing_ids:
+                        roster_lookup = student_roster_df.set_index("student_id").to_dict().get("student_name", {})
+                        for sid in missing_ids:
+                            student_summary = pd.concat(
+                                [
+                                    student_summary,
+                                    pd.DataFrame(
+                                        {
+                                            "student_id": [sid],
+                                            "student_name": [roster_lookup.get(sid, sid)],
+                                            "total_score": [0],
+                                            "participation_points": [0],
+                                            "overall_grade": [0],
+                                        }
+                                    ),
+                                ],
+                                ignore_index=True,
+                            )
+                    student_summary["overall_grade"] = student_summary["total_score"] + student_summary["participation_points"]
+                    student_summary = student_summary.rename(
+                        columns={
+                            "student_id": "Student ID",
+                            "student_name": "Student Name",
+                            "total_score": "TTL Score from Activities",
+                            "participation_points": "TTL Participation Points",
+                            "overall_grade": "Final Score",
+                        }
+                    )
+                    summary_display = student_summary.copy()
+                    summary_view = summary_display.copy()
+                    detail_df = answers_all.copy()
+                    if selected_student != "All students":
+                        detail_df = detail_df[detail_df["student_id"] == selected_student]
+                        summary_view = summary_view[summary_view["Student ID"] == selected_student]
+                    if detail_df.empty:
+                        st.info("No response-level scores available for this selection yet.")
+                        detail_display = pd.DataFrame(
+                            columns=[
+                                "Student ID",
+                                "Student Name",
+                                "Group Name",
+                                "Activity Date",
+                                "Activity",
+                                "Question #",
+                                "Question",
+                                "Submitted Response",
+                                "Score",
+                            ]
+                        )
                     else:
-                        summary_df_display = summary_df[
-                            ["student_id", "total_score", "participation_points", "overall_grade", "calculated_grade"]
-                        ]
-                        summary_df_display = summary_df_display.rename(
+                        activity_dates = {
+                            row["id"]: safe_date_label(row["activity_date"])
+                            for _, row in activities_all.iterrows()
+                        }
+                        detail_df["activity_date"] = detail_df["activity_id"].map(activity_dates)
+                        detail_display = detail_df.rename(
                             columns={
                                 "student_id": "Student ID",
-                                "total_score": "Score",
-                                "participation_points": "Participation",
-                                "overall_grade": "Final grade",
-                                "calculated_grade": "Score + participation",
+                                "student_name": "Student Name",
+                                "group_name": "Group Name",
+                                "activity_name": "Activity",
+                                "activity_date": "Activity Date",
+                                "question_no": "Question #",
+                                "question": "Question",
+                                "answer": "Submitted Response",
+                                "score": "Score",
                             }
                         )
-                        edited_summary = st.data_editor(
-                            summary_df_display,
-                            column_config={
-                                "Participation": st.column_config.NumberColumn("Participation", min_value=0.0, step=0.5),
-                                "Final grade": st.column_config.NumberColumn("Final grade", min_value=0.0, step=0.5),
-                            },
-                            hide_index=True,
+                        detail_display = detail_display[
+                            [
+                                "Student ID",
+                                "Student Name",
+                                "Group Name",
+                                "Activity Date",
+                                "Activity",
+                                "Question #",
+                                "Question",
+                                "Submitted Response",
+                                "Score",
+                            ]
+                        ]
+                    participation_entries = load_participation_daily_entries()
+                    participation_entries = attach_names(participation_entries)
+                    participation_entries = participation_entries.rename(
+                        columns={
+                            "student_id": "Student ID",
+                            "student_name": "Student Name",
+                            "check_in_date": "Date",
+                            "participation_points": "Participation Points",
+                            "teacher_note": "Teacher Note",
+                        }
+                    )
+                    participation_entries = participation_entries[
+                        ["Student ID", "Student Name", "Date", "Participation Points", "Teacher Note"]
+                    ]
+                    if selected_student != "All students":
+                        participation_entries = participation_entries[participation_entries["Student ID"] == selected_student]
+                    if HAS_XLSXWRITER and (not summary_view.empty or not detail_display.empty or not participation_entries.empty):
+                        export_buffer = io.BytesIO()
+                        with pd.ExcelWriter(export_buffer, engine="xlsxwriter") as writer:  # type: ignore[arg-type]
+                            summary_view.to_excel(writer, sheet_name="Summary", index=False)
+                            detail_display.to_excel(writer, sheet_name="By Activity", index=False)
+                            participation_entries.to_excel(writer, sheet_name="Participation Points", index=False)
+                        st.download_button(
+                            "⬇️ Export gradebook (.xlsx)",
+                            data=export_buffer.getvalue(),
+                            file_name="gradebook_by_student.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True,
-                            key="participation_editor",
                         )
-                        revert_df = edited_summary.rename(
-                            columns={
-                                "Student ID": "student_id",
-                                "Score": "total_score",
-                                "Participation": "participation_points",
-                                "Final grade": "overall_grade",
-                                "Score + participation": "calculated_grade",
-                            }
-                        )
-                        if st.button("💾 Save participation / final grades", use_container_width=True):
-                            save_participation(
-                                participation_activity_id, revert_df[["student_id", "participation_points", "overall_grade"]]
-                            )
-                            st.success("Participation saved.")
-
-                        responses_df, summary_export = build_gradebook(participation_activity_id)
-                        if not responses_df.empty:
-                            if HAS_XLSXWRITER:
-                                output = io.BytesIO()
-                                with pd.ExcelWriter(output, engine="xlsxwriter") as writer:  # type: ignore[arg-type]
-                                    responses_df.to_excel(writer, sheet_name="Responses", index=False)
-                                    summary_export.to_excel(writer, sheet_name="Summary", index=False)
-                                st.download_button(
-                                    "⬇️ Export gradebook (.xlsx)",
-                                    data=output.getvalue(),
-                                    file_name=f"gradebook_activity_{participation_activity_id}.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    use_container_width=True,
-                                )
-                            else:
-                                st.warning(
-                                    "Install the optional dependency `xlsxwriter` (see requirements.txt) to enable Excel exports."
-                                )
+                    elif not HAS_XLSXWRITER:
+                        st.warning("Install the optional dependency `xlsxwriter` (see requirements.txt) to enable Excel exports.")
+                    st.markdown("**Summary by Student**")
+                    if summary_view.empty:
+                        st.info("No student summary available for this selection.")
+                    else:
+                        st.dataframe(summary_view, hide_index=True, use_container_width=True)
+                    st.markdown("**Summary by Activities**")
+                    st.dataframe(detail_display, hide_index=True, use_container_width=True)
+                    st.markdown("**Summary of Participation Points**")
+                    st.dataframe(participation_entries, hide_index=True, use_container_width=True)
 
         # ----- Tab: Import student names -----
         with tab_import:
