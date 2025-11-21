@@ -49,6 +49,24 @@ FREE_RESPONSE_DESCRIPTION = (
 )
 FREE_RESPONSE_ACTIVITY_ID: int | None = None
 
+DATA_DELETE_ACTIONS: dict[str, list[str]] = {
+    "Student responses & grades": [
+        "DELETE FROM answers",
+        "DELETE FROM student_activity",
+    ],
+    "Activities & questions": [
+        "DELETE FROM questions",
+        "DELETE FROM activities",
+    ],
+    "Check-ins & daily participation": [
+        "DELETE FROM participation_daily",
+        "DELETE FROM check_ins",
+    ],
+    "Student roster": [
+        "DELETE FROM student_roster",
+    ],
+}
+
 
 def now_th():
     return datetime.now(TH_TZ)
@@ -604,6 +622,25 @@ def update_checked(ids, checked=True):
     )
     con.commit()
     con.close()
+
+
+def delete_data_sections(selections: list[str]):
+    if not selections:
+        return False, "No sections selected."
+    con = get_con()
+    cur = con.cursor()
+    try:
+        for key in selections:
+            statements = DATA_DELETE_ACTIONS.get(key, [])
+            for stmt in statements:
+                cur.execute(stmt)
+        con.commit()
+    except Exception as exc:
+        con.rollback()
+        con.close()
+        return False, f"Unable to delete data: {exc}"
+    con.close()
+    return True, "Selected data has been deleted."
 
 
 def update_scores(changes: list[dict]):
@@ -1414,18 +1451,6 @@ with tab_teacher:
             st.session_state.teacher_loaded = False
             st.session_state.grading_filter = {}
             st.rerun()
-        with st.expander("Change password", expanded=False):
-            st.caption("This updates the in-memory password for this session. Also update your environment/secrets for persistence.")
-            new_pw = st.text_input("New password", type="password", key="change_pw_new")
-            confirm_pw = st.text_input("Confirm new password", type="password", key="change_pw_confirm")
-            if st.button("Update password"):
-                if not new_pw:
-                    st.error("Password cannot be empty.")
-                elif new_pw != confirm_pw:
-                    st.error("Passwords do not match.")
-                else:
-                    set_teacher_password(new_pw)
-                    st.success("Password updated for this session.")
         activities_all = get_activities(active_only=False)
 
         tab_class_prep, tab_responses, tab_participation, tab_scores, tab_import, tab_backup = st.tabs(
@@ -2003,7 +2028,72 @@ with tab_teacher:
             if roster_df.empty:
                 st.info("No roster loaded yet.")
             else:
-                st.dataframe(roster_df, use_container_width=True, hide_index=True)
+                st.markdown("#### ✏️ Edit roster entries")
+                edit_display = roster_df.rename(
+                    columns={
+                        "student_id": "Student ID",
+                        "student_name": "Student Name",
+                    }
+                )
+                editable_roster = st.data_editor(
+                    edit_display,
+                    column_config={
+                        "Student ID": st.column_config.TextColumn("Student ID", help="IDs cannot be changed here."),
+                        "Student Name": st.column_config.TextColumn("Student Name", help="Edit the student name."),
+                    },
+                    disabled=["Student ID"],
+                    hide_index=True,
+                    use_container_width=True,
+                    key="roster_editor",
+                )
+                if st.button("💾 Save roster edits", use_container_width=True):
+                    records = [
+                        (str(row["Student ID"]).strip(), str(row["Student Name"]).strip())
+                        for _, row in editable_roster.iterrows()
+                        if str(row["Student ID"]).strip() and str(row["Student Name"]).strip()
+                    ]
+                    if not records:
+                        st.warning("No valid rows to save.")
+                    else:
+                        upsert_roster(records)
+                        st.success("Roster updated.")
+                        roster_df = load_roster()
+                st.markdown("#### 🗑️ Delete roster entries")
+                roster_delete = st.multiselect(
+                    "Select Student IDs to delete",
+                    options=roster_df["student_id"].tolist(),
+                    format_func=lambda x: f"{x} · {get_student_name(x) or 'Unnamed'}",
+                    key="roster_delete_select",
+                )
+                if st.button("Delete selected students", type="secondary", disabled=not roster_delete):
+                    con = get_con()
+                    cur = con.cursor()
+                    placeholders = ",".join(["?"] * len(roster_delete))
+                    try:
+                        cur.execute(f"DELETE FROM student_roster WHERE student_id IN ({placeholders})", roster_delete)
+                        con.commit()
+                        st.success(f"Deleted {len(roster_delete)} students from roster.")
+                        roster_df = load_roster()
+                    except Exception as exc:
+                        con.rollback()
+                        st.error(f"Unable to delete roster entries: {exc}")
+                    finally:
+                        con.close()
+                st.markdown("#### ➕ Add student manually")
+                with st.form("add_student_form"):
+                    manual_id = st.text_input("Student ID", placeholder="e.g., S001")
+                    manual_name = st.text_input("Student Name", placeholder="e.g., Jane Doe")
+                    manual_submit = st.form_submit_button("Add student")
+                if manual_submit:
+                    sid = manual_id.strip()
+                    sname = manual_name.strip()
+                    if not sid or not sname:
+                        st.error("Both Student ID and Student Name are required.")
+                    else:
+                        upsert_roster([(sid, sname)])
+                        st.success(f"Added/updated roster entry for {sid}.")
+                        roster_df = load_roster()
+
 
         # ----- Tab: Database backup -----
         with tab_backup:
@@ -2027,3 +2117,20 @@ with tab_teacher:
                         st.success(msg)
                     else:
                         st.error(msg)
+            with st.expander("🗑️ Delete data from database"):
+                st.warning("This action permanently removes data from the current database. Download a backup first.")
+                delete_choices = st.multiselect(
+                    "Select the data you want to delete",
+                    options=list(DATA_DELETE_ACTIONS.keys()),
+                    key="delete_sections_select",
+                )
+                confirm_delete = st.text_input("Type DELETE to confirm", key="delete_sections_confirm")
+                if st.button("Delete selected data", type="primary", disabled=not delete_choices):
+                    if confirm_delete.strip().upper() != "DELETE":
+                        st.error("Please type DELETE in the confirmation box.")
+                    else:
+                        ok, message = delete_data_sections(delete_choices)
+                        if ok:
+                            st.success(message)
+                        else:
+                            st.error(message)
