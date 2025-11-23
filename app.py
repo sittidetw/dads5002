@@ -47,6 +47,7 @@ FREE_RESPONSE_ACTIVITY_NAME = "Free response (student-defined)"
 FREE_RESPONSE_DESCRIPTION = (
     "This system-managed activity lets students craft their own prompts and submit long-form answers."
 )
+FREE_RESPONSE_FIXED_ID = 0
 FREE_RESPONSE_ACTIVITY_ID: int | None = None
 
 DATA_DELETE_ACTIONS: dict[str, list[str]] = {
@@ -339,33 +340,43 @@ def get_activities(active_only=True) -> pd.DataFrame:
 def ensure_free_response_activity():
     con = get_con()
     cur = con.cursor()
-    cur.execute("SELECT id, active FROM activities WHERE name=? LIMIT 1", (FREE_RESPONSE_ACTIVITY_NAME,))
-    row = cur.fetchone()
-    if row:
-        activity_id = int(row[0])
-        if not bool(row[1]):
-            cur.execute("UPDATE activities SET active=1 WHERE id=?", (activity_id,))
-            con.commit()
-        con.close()
-        return activity_id
     cur.execute(
         """
-        INSERT INTO activities (name, activity_date, assignment_type, description, active)
-        VALUES (?,?,?,?,1)
+        INSERT OR IGNORE INTO activities (id, name, activity_date, assignment_type, description, active)
+        VALUES (?, ?, ?, ?, ?, 1)
         """,
-        (FREE_RESPONSE_ACTIVITY_NAME, None, "Individual", FREE_RESPONSE_DESCRIPTION),
+        (
+            FREE_RESPONSE_FIXED_ID,
+            FREE_RESPONSE_ACTIVITY_NAME,
+            None,
+            "Individual",
+            FREE_RESPONSE_DESCRIPTION,
+        ),
     )
-    activity_id = cur.lastrowid
+    cur.execute(
+        """
+        UPDATE activities
+        SET name=?, assignment_type=?, description=?, active=1
+        WHERE id=?
+        """,
+        (
+            FREE_RESPONSE_ACTIVITY_NAME,
+            "Individual",
+            FREE_RESPONSE_DESCRIPTION,
+            FREE_RESPONSE_FIXED_ID,
+        ),
+    )
+    cur.execute("DELETE FROM activities WHERE name=? AND id<>?", (FREE_RESPONSE_ACTIVITY_NAME, FREE_RESPONSE_FIXED_ID))
     con.commit()
     con.close()
-    return int(activity_id)
+    return FREE_RESPONSE_FIXED_ID
 
 
 def is_free_response_activity(activity_id):
-    if activity_id is None or FREE_RESPONSE_ACTIVITY_ID is None:
+    if activity_id is None:
         return False
     try:
-        return int(activity_id) == int(FREE_RESPONSE_ACTIVITY_ID)
+        return int(activity_id) == FREE_RESPONSE_FIXED_ID
     except (TypeError, ValueError):
         return False
 
@@ -942,6 +953,39 @@ def attach_names(df: pd.DataFrame):
         merged["student_name"] = merged.get("student_name_x").combine_first(merged.get("student_name_y"))
         merged = merged.drop(columns=["student_name_x", "student_name_y"], errors="ignore")
     return merged
+
+
+def ensure_dataframe_columns(df: pd.DataFrame, defaults: dict[str, object]):
+    for col, default in defaults.items():
+        if col not in df.columns:
+            df[col] = default
+    return df
+
+
+def ensure_student_names(df: pd.DataFrame, id_col: str, name_col: str):
+    """Guarantee that the display table has a Student Name column even if no roster exists."""
+    if df is None or df.empty or id_col not in df.columns:
+        return df
+    df = df.copy()
+    id_values = df[id_col].astype(str)
+    if name_col not in df.columns:
+        df[name_col] = id_values
+        return df
+    df[name_col] = df[name_col].fillna("").astype(str)
+    empty_mask = df[name_col].str.strip() == ""
+    df.loc[empty_mask, name_col] = id_values[empty_mask]
+    return df
+
+
+def normalize_student_ids(values) -> set[str]:
+    normalized: set[str] = set()
+    for val in values:
+        if val is None:
+            continue
+        text = str(val).strip()
+        if text:
+            normalized.add(text)
+    return normalized
 
 
 def load_all_daily_participation_totals():
@@ -1754,6 +1798,16 @@ with tab_teacher:
                         "teacher_note": "Teacher note",
                     }
                 )
+                display_daily = ensure_dataframe_columns(
+                    display_daily,
+                    {
+                        "Student ID": "",
+                        "Student Name": "",
+                        "Checked-in at": "",
+                        "Participation points": 0.0,
+                        "Teacher note": "",
+                    },
+                )
                 display_daily = display_daily[
                     [
                         "Student ID",
@@ -1811,70 +1865,95 @@ with tab_teacher:
         with tab_scores:
             st.markdown("### 📊 Gradebook & Exports (by student)")
             student_roster_df = load_roster()
-            if student_roster_df.empty:
-                st.info("No students in roster yet.")
-            else:
-                student_options = ["All students", *student_roster_df["student_id"].tolist()]
-                selected_student = st.selectbox(
-                    "Student ID",
-                    options=student_options,
-                    key="gradebook_student_select",
+            answers_all = load_answers()
+            answer_ids = normalize_student_ids(answers_all.get("student_id", pd.Series(dtype=str)).tolist())
+            activities = activities_all["id"].tolist()
+            per_activity = []
+            for act_id in activities:
+                summary_df = get_participation(act_id)
+                per_activity.append(summary_df)
+            checkin_students = load_all_checkin_students()
+            checkin_ids = normalize_student_ids(checkin_students.get("student_id", pd.Series(dtype=str)).tolist())
+            daily_totals = load_all_daily_participation_totals()
+            daily_ids = normalize_student_ids(daily_totals.get("student_id", pd.Series(dtype=str)).tolist())
+            roster_ids = normalize_student_ids(student_roster_df.get("student_id", pd.Series(dtype=str)).tolist())
+            computed_ids = roster_ids | answer_ids | checkin_ids | daily_ids
+            student_options = ["All students"]
+            if computed_ids:
+                student_options.extend(sorted(computed_ids))
+            selected_student = st.selectbox(
+                "Student ID",
+                options=student_options,
+                key="gradebook_student_select",
+            )
+            st.caption("Showing per-student totals across all activities.")
+            gradebook_df = pd.DataFrame()
+            summary_display = pd.DataFrame()
+            detail_display = pd.DataFrame()
+            if per_activity:
+                gradebook_df = pd.concat(per_activity, ignore_index=True)
+            if gradebook_df.empty:
+                gradebook_df = pd.DataFrame(
+                    columns=["student_id", "student_name", "total_score", "participation_points", "overall_grade"]
                 )
-                st.caption("Showing per-student totals across all activities.")
-                gradebook_df = pd.DataFrame()
-                summary_display = pd.DataFrame()
-                detail_display = pd.DataFrame()
-                answers_all = load_answers()
-                activities = activities_all["id"].tolist()
-                per_activity = []
-                for act_id in activities:
-                    summary_df = get_participation(act_id)
-                    per_activity.append(summary_df)
-                if per_activity:
-                    gradebook_df = pd.concat(per_activity, ignore_index=True)
-                checkin_students = load_all_checkin_students()
-                checkin_ids = set(checkin_students.get("student_id", pd.Series()).tolist())
-                daily_totals = load_all_daily_participation_totals()
-                daily_ids = set(daily_totals.get("student_id", pd.Series()).tolist())
-                if gradebook_df.empty:
-                    gradebook_df = pd.DataFrame(
-                        columns=["student_id", "student_name", "total_score", "participation_points", "overall_grade"]
+            roster_id_set = roster_ids
+            response_ids = normalize_student_ids(gradebook_df.get("student_id", pd.Series(dtype=str)).tolist())
+            all_student_ids = roster_id_set | checkin_ids | daily_ids | response_ids | answer_ids
+            has_any_data = (
+                bool(all_student_ids)
+                or not gradebook_df.empty
+                or not answers_all.empty
+                or not daily_totals.empty
+            )
+            if not has_any_data:
+                st.info("No grade data available for this selection yet.")
+            else:
+                gradebook_df = gradebook_df.reindex(columns=["student_id", "student_name", "total_score", "participation_points", "overall_grade"])
+                gradebook_df = attach_names(gradebook_df)
+                student_summary = (
+                    gradebook_df.groupby(["student_id", "student_name"], dropna=False)
+                    .agg(
+                        total_score=("total_score", "sum"),
+                        participation_points=("participation_points", "sum"),
+                        overall_grade=("overall_grade", "sum"),
                     )
-                response_ids = set(gradebook_df.get("student_id", pd.Series()).tolist())
-                roster_ids = set(student_roster_df["student_id"].tolist())
-                all_student_ids = roster_ids.union(checkin_ids).union(response_ids).union(daily_ids)
-                if gradebook_df.empty and not all_student_ids:
-                    st.info("No grade data available for this selection yet.")
-                else:
-                    gradebook_df = gradebook_df.reindex(columns=["student_id", "student_name", "total_score", "participation_points", "overall_grade"])
-                    gradebook_df = attach_names(gradebook_df)
-                    student_summary = (
-                        gradebook_df.groupby(["student_id", "student_name"], dropna=False)
-                        .agg(
-                            total_score=("total_score", "sum"),
-                            participation_points=("participation_points", "sum"),
-                            overall_grade=("overall_grade", "sum"),
-                        )
+                    .reset_index()
+                )
+                if student_summary.empty and not answers_all.empty:
+                    fallback_answers = answers_all.copy()
+                    if "student_name" not in fallback_answers.columns:
+                        fallback_answers["student_name"] = ""
+                    fallback_answers["score"] = fallback_answers.get("score", pd.Series(dtype=float)).fillna(0.0)
+                    summary_from_answers = (
+                        fallback_answers.groupby(["student_id", "student_name"], dropna=False)
+                        .agg(total_score=("score", "sum"))
                         .reset_index()
                     )
-                    if not daily_totals.empty:
-                        daily_totals = attach_names(daily_totals)
-                        daily_merge = daily_totals.rename(columns={"student_name": "daily_student_name"})
-                        student_summary = student_summary.merge(daily_merge, on="student_id", how="outer")
-                        if "student_name" not in student_summary.columns:
-                            student_summary["student_name"] = ""
-                        if "daily_student_name" in student_summary.columns:
-                            student_summary["student_name"] = student_summary["student_name"].fillna(
-                                student_summary["daily_student_name"]
-                            )
-                            student_summary = student_summary.drop(columns=["daily_student_name"], errors="ignore")
-                        for col in ("total_score", "participation_points", "overall_grade", "daily_points"):
-                            if col not in student_summary.columns:
-                                student_summary[col] = 0
-                            else:
-                                student_summary[col] = student_summary[col].fillna(0)
-                        student_summary["participation_points"] = student_summary["participation_points"] + student_summary["daily_points"]
-                        student_summary = student_summary.drop(columns=["daily_points"], errors="ignore")
+                    summary_from_answers["participation_points"] = 0.0
+                    summary_from_answers["overall_grade"] = summary_from_answers["total_score"]
+                    student_summary = summary_from_answers
+                if "student_name" not in student_summary.columns:
+                    student_summary["student_name"] = ""
+                if not daily_totals.empty:
+                    daily_totals = attach_names(daily_totals)
+                    daily_merge = daily_totals.rename(columns={"student_name": "daily_student_name"})
+                    student_summary = student_summary.merge(daily_merge, on="student_id", how="outer")
+                    if "student_name" not in student_summary.columns:
+                        student_summary["student_name"] = ""
+                    if "daily_student_name" in student_summary.columns:
+                        student_summary["student_name"] = student_summary["student_name"].fillna(
+                            student_summary["daily_student_name"]
+                        )
+                        student_summary = student_summary.drop(columns=["daily_student_name"], errors="ignore")
+                    for col in ("total_score", "participation_points", "overall_grade", "daily_points"):
+                        if col not in student_summary.columns:
+                            student_summary[col] = 0
+                        else:
+                            student_summary[col] = student_summary[col].fillna(0)
+                    student_summary["participation_points"] = (
+                        student_summary["participation_points"] + student_summary["daily_points"]
+                    )
+                    student_summary = student_summary.drop(columns=["daily_points"], errors="ignore")
                     existing_ids = student_summary["student_id"].tolist() if "student_id" in student_summary.columns else []
                     missing_ids = [sid for sid in all_student_ids if sid not in existing_ids]
                     if missing_ids:
@@ -1906,6 +1985,7 @@ with tab_teacher:
                         }
                     )
                     summary_display = student_summary.copy()
+                    summary_display = ensure_student_names(summary_display, "Student ID", "Student Name")
                     summary_view = summary_display.copy()
                     detail_df = answers_all.copy()
                     if selected_student != "All students":
@@ -1943,21 +2023,36 @@ with tab_teacher:
                                 "question": "Question",
                                 "answer": "Submitted Response",
                                 "score": "Score",
-                            }
-                        )
-                        detail_display = detail_display[
-                            [
-                                "Student ID",
-                                "Student Name",
-                                "Group Name",
-                                "Activity Date",
-                                "Activity",
-                                "Question #",
-                                "Question",
-                                "Submitted Response",
-                                "Score",
-                            ]
+                        }
+                    )
+                    detail_display = ensure_dataframe_columns(
+                        detail_display,
+                        {
+                            "Student ID": "",
+                            "Student Name": "",
+                            "Group Name": "",
+                            "Activity Date": "",
+                            "Activity": "",
+                            "Question #": "",
+                            "Question": "",
+                            "Submitted Response": "",
+                            "Score": "",
+                        },
+                    )
+                    detail_display = detail_display[
+                        [
+                            "Student ID",
+                            "Student Name",
+                            "Group Name",
+                            "Activity Date",
+                            "Activity",
+                            "Question #",
+                            "Question",
+                            "Submitted Response",
+                            "Score",
                         ]
+                    ]
+                    detail_display = ensure_student_names(detail_display, "Student ID", "Student Name")
                     participation_entries = load_participation_daily_entries()
                     participation_entries = attach_names(participation_entries)
                     participation_entries = participation_entries.rename(
@@ -1969,9 +2064,20 @@ with tab_teacher:
                             "teacher_note": "Teacher Note",
                         }
                     )
+                    participation_entries = ensure_dataframe_columns(
+                        participation_entries,
+                        {
+                            "Student ID": "",
+                            "Student Name": "",
+                            "Date": "",
+                            "Participation Points": 0.0,
+                            "Teacher Note": "",
+                        },
+                    )
                     participation_entries = participation_entries[
                         ["Student ID", "Student Name", "Date", "Participation Points", "Teacher Note"]
                     ]
+                    participation_entries = ensure_student_names(participation_entries, "Student ID", "Student Name")
                     if selected_student != "All students":
                         participation_entries = participation_entries[participation_entries["Student ID"] == selected_student]
                     if HAS_XLSXWRITER and (not summary_view.empty or not detail_display.empty or not participation_entries.empty):
@@ -2027,37 +2133,41 @@ with tab_teacher:
                     st.error(f"Unable to read roster CSV: {exc}")
             if roster_df.empty:
                 st.info("No roster loaded yet.")
-            else:
-                st.markdown("#### ✏️ Edit roster entries")
-                edit_display = roster_df.rename(
+            edit_display = (
+                pd.DataFrame(columns=["Student ID", "Student Name"])
+                if roster_df.empty
+                else roster_df.rename(
                     columns={
                         "student_id": "Student ID",
                         "student_name": "Student Name",
                     }
                 )
-                editable_roster = st.data_editor(
-                    edit_display,
-                    column_config={
-                        "Student ID": st.column_config.TextColumn("Student ID", help="IDs cannot be changed here."),
-                        "Student Name": st.column_config.TextColumn("Student Name", help="Edit the student name."),
-                    },
-                    disabled=["Student ID"],
-                    hide_index=True,
-                    use_container_width=True,
-                    key="roster_editor",
-                )
-                if st.button("💾 Save roster edits", use_container_width=True):
-                    records = [
-                        (str(row["Student ID"]).strip(), str(row["Student Name"]).strip())
-                        for _, row in editable_roster.iterrows()
-                        if str(row["Student ID"]).strip() and str(row["Student Name"]).strip()
-                    ]
-                    if not records:
-                        st.warning("No valid rows to save.")
-                    else:
-                        upsert_roster(records)
-                        st.success("Roster updated.")
-                        roster_df = load_roster()
+            )
+            st.markdown("#### ✏️ Edit roster entries")
+            editable_roster = st.data_editor(
+                edit_display,
+                column_config={
+                    "Student ID": st.column_config.TextColumn("Student ID", help="IDs cannot be changed here."),
+                    "Student Name": st.column_config.TextColumn("Student Name", help="Edit the student name."),
+                },
+                disabled=["Student ID"],
+                hide_index=True,
+                use_container_width=True,
+                key="roster_editor",
+            )
+            if st.button("💾 Save roster edits", use_container_width=True):
+                records = [
+                    (str(row["Student ID"]).strip(), str(row["Student Name"]).strip())
+                    for _, row in editable_roster.iterrows()
+                    if str(row["Student ID"]).strip() and str(row["Student Name"]).strip()
+                ]
+                if not records:
+                    st.warning("No valid rows to save.")
+                else:
+                    upsert_roster(records)
+                    st.success("Roster updated.")
+                    roster_df = load_roster()
+            if not roster_df.empty:
                 st.markdown("#### 🗑️ Delete roster entries")
                 roster_delete = st.multiselect(
                     "Select Student IDs to delete",
@@ -2079,20 +2189,20 @@ with tab_teacher:
                         st.error(f"Unable to delete roster entries: {exc}")
                     finally:
                         con.close()
-                st.markdown("#### ➕ Add student manually")
-                with st.form("add_student_form"):
-                    manual_id = st.text_input("Student ID", placeholder="e.g., S001")
-                    manual_name = st.text_input("Student Name", placeholder="e.g., Jane Doe")
-                    manual_submit = st.form_submit_button("Add student")
-                if manual_submit:
-                    sid = manual_id.strip()
-                    sname = manual_name.strip()
-                    if not sid or not sname:
-                        st.error("Both Student ID and Student Name are required.")
-                    else:
-                        upsert_roster([(sid, sname)])
-                        st.success(f"Added/updated roster entry for {sid}.")
-                        roster_df = load_roster()
+            st.markdown("#### ➕ Add student manually")
+            with st.form("add_student_form"):
+                manual_id = st.text_input("Student ID", placeholder="e.g., S001")
+                manual_name = st.text_input("Student Name", placeholder="e.g., Jane Doe")
+                manual_submit = st.form_submit_button("Add student")
+            if manual_submit:
+                sid = manual_id.strip()
+                sname = manual_name.strip()
+                if not sid or not sname:
+                    st.error("Both Student ID and Student Name are required.")
+                else:
+                    upsert_roster([(sid, sname)])
+                    st.success(f"Added/updated roster entry for {sid}.")
+                    roster_df = load_roster()
 
 
         # ----- Tab: Database backup -----
