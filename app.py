@@ -1236,6 +1236,7 @@ def handle_mc_change(question_idx: int, question: dict, total_questions: int, ke
         set_nav_warning("")
         if question_idx < total_questions - 1:
             st.session_state.q_index = question_idx + 1
+            st.rerun()
 
 
 def answer_is_filled(question: dict, answer) -> bool:
@@ -1407,6 +1408,7 @@ with tab_student:
                     st.session_state.q_index = max(0, q_idx - 1)
                     st.session_state.show_preview = False
                     set_nav_warning("")
+                    st.rerun()
             with c2:
                 next_clicked = st.button(
                     "➡️ Next",
@@ -1415,12 +1417,15 @@ with tab_student:
                     key=f"next_btn_{q_idx}",
                 )
                 if next_clicked:
-                    if not current_a_filled:
+                    latest_answer = st.session_state.get(answer_widget_key, st.session_state.answers[q_idx])
+                    st.session_state.answers[q_idx] = latest_answer
+                    if not answer_is_filled(current_q, latest_answer):
                         set_nav_warning("Please answer this question before continuing.")
                     else:
                         st.session_state.q_index = min(total - 1, q_idx + 1)
                         st.session_state.show_preview = False
                         set_nav_warning("")
+                        st.rerun()
 
             if st.session_state.get("nav_warning"):
                 st.warning(st.session_state["nav_warning"])
